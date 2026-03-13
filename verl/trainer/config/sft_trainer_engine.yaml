@@ -69,6 +69,7 @@ trainer:
   seed: 1
   save_freq: -1
   test_freq: -1
+  ray_rpc_train_steps: 1  # Number of training steps per Ray RPC call (1 = original behavior)
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
 
   # Resume mode: "auto", "disable", or "resume_path"
