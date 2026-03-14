@@ -1,5 +1,6 @@
-pytest
+parameterized
 pre-commit
 py-spy
+pytest
 pytest-asyncio
 pytest-rerunfailures

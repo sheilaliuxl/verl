@@ -49,6 +49,18 @@ from verl.workers.utils.losses import ppo_loss
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# TensorDict NonTensorData keys for single-step training (_train_one_step).
+_KEY_DISABLE_AUTO_OFFLOAD = "disable_auto_offload"
+_KEY_GLOBAL_TOKEN_NUM = "global_token_num"
+_KEY_IMAGES_SEQLENS = "images_seqlens"
+_KEY_METRICS = "metrics"
+_KEY_UPDATE_LR_SCHEDULER = "update_lr_scheduler"
+
+# TensorDict NonTensorData keys for multi-step training (train_multi_batch).
+_KEY_ALL_GLOBAL_TOKEN_NUMS = "all_global_token_nums"
+_KEY_ALL_METRICS = "all_metrics"
+_KEY_NUM_STEPS = "num_steps"
+
 
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
@@ -302,14 +314,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = None
         return output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
-    def train_batch(self, data: TensorDict) -> TensorDict:
-        assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
-        assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
+    def _train_one_step(self, data: TensorDict) -> TensorDict:
+        """Core single-step training logic shared by train_batch and train_multi_batch."""
         # global_token_num should be a list of number of tokens of each seq in this batch
-        global_token_num = tu.get(data, key="global_token_num")
-        disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
-        images_seqlens = tu.get(data, key="images_seqlens", default=None)
+        global_token_num = tu.get(data, key=_KEY_GLOBAL_TOKEN_NUM)
+        disable_auto_offload = tu.get(data, key=_KEY_DISABLE_AUTO_OFFLOAD, default=False)
+        images_seqlens = tu.get(data, key=_KEY_IMAGES_SEQLENS, default=None)
 
         # inject engineering parameters if not specified
         default_keys = dict(
@@ -333,7 +343,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # for training, we only care about loss and metrics
         delta_time = timer.last
 
-        update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
+        update_lr_scheduler = tu.get(data, key=_KEY_UPDATE_LR_SCHEDULER, default=False)
         # update lr scheduler
         if update_lr_scheduler:
             lr = self.engine.lr_scheduler_step()
@@ -358,13 +368,83 @@ class TrainingWorker(Worker, DistProfilerExtension):
         return final_output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    def train_batch(self, data: TensorDict) -> TensorDict:
+        """Train a single batch. Used by SPMD trainer (sft_trainer.py) and PPO."""
+        assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
+        assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
+        return self._train_one_step(data)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    def train_multi_batch(self, data: TensorDict) -> TensorDict:
+        """Train N batches in a single RPC call to reduce Ray overhead.
+
+        Expects tensor fields interleaved as [B*N, ...] with NonTensorData fields:
+        num_steps (int), all_global_token_nums (list of N lists).
+        Returns all_metrics (list of N metric dicts).
+        """
+        assert self.loss_fn is not None, "loss function can't be None when calling train_multi_batch"
+        assert not self.engine_config.forward_only, (
+            "Can't run `train_multi_batch` when forward_only is in the engine config."
+        )
+
+        num_steps = tu.get(data, key=_KEY_NUM_STEPS)
+        update_lr_scheduler = tu.get(data, key=_KEY_UPDATE_LR_SCHEDULER, default=True)
+        all_global_token_nums = tu.get(data, key=_KEY_ALL_GLOBAL_TOKEN_NUMS)
+        local_batch_size = data.batch_size[0] // num_steps
+
+        # Check if any tensor field is nested (variable-length sequences).
+        has_nested = any(v.is_nested for v in data.values() if isinstance(v, torch.Tensor))
+
+        all_metrics = []
+        for i in range(num_steps):
+            if num_steps == 1:
+                step_data = data
+            elif has_nested:
+                # Nested tensors don't support dim=0 slicing; rebuild per-step TensorDict
+                # and copy NonTensorData (meta_info) from the original data.
+                start, end = i * local_batch_size, (i + 1) * local_batch_size
+                step_dict = {}
+                for key, val in data.items():
+                    if isinstance(val, torch.Tensor) and val.is_nested:
+                        step_dict[key] = torch.nested.as_nested_tensor(
+                            [val[j] for j in range(start, end)], layout=torch.jagged
+                        )
+                    elif isinstance(val, torch.Tensor):
+                        step_dict[key] = val[start:end]
+                step_data = TensorDict(step_dict, batch_size=[local_batch_size])
+                # Copy NonTensorData fields (meta_info) from original data.
+                for key, val in data.items():
+                    if not isinstance(val, torch.Tensor):
+                        step_data[key] = val
+            else:
+                step_data = data[i * local_batch_size : (i + 1) * local_batch_size]
+            tu.assign_non_tensor(
+                step_data,
+                **{
+                    _KEY_UPDATE_LR_SCHEDULER: update_lr_scheduler,
+                    _KEY_GLOBAL_TOKEN_NUM: NonTensorData(all_global_token_nums[i]),
+                },
+            )
+
+            final_output = self._train_one_step(step_data)
+            if final_output is not None:
+                metrics = tu.get(final_output, _KEY_METRICS)
+                all_metrics.append(metrics)
+
+        if self.engine.is_mp_src_rank_with_outputs():
+            output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={_KEY_ALL_METRICS: all_metrics}).cpu()
+        else:
+            output = None
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def infer_batch(self, data: TensorDict) -> TensorDict:
         # add mfu calculator
-        global_token_num = tu.get(data, key="global_token_num")
+        global_token_num = tu.get(data, key=_KEY_GLOBAL_TOKEN_NUM)
         compute_loss = tu.get(data, key="compute_loss", default=True)
-        disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
+        disable_auto_offload = tu.get(data, key=_KEY_DISABLE_AUTO_OFFLOAD, default=False)
         no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
-        images_seqlens = tu.get(data, key="images_seqlens", default=None)
+        images_seqlens = tu.get(data, key=_KEY_IMAGES_SEQLENS, default=None)
 
         default_keys = dict(
             use_remove_padding=self.model_config.use_remove_padding,

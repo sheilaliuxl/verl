@@ -14,8 +14,10 @@
 
 
 import os
+import time
 from functools import partial
 
+from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -243,6 +245,71 @@ class SFTTrainer:
             batch_seqlens: torch.Tensor = data["attention_mask"].sum(dim=-1)
         return batch_seqlens
 
+    def _compute_ray_rpc_train_steps(self, global_step):
+        """Compute how many steps to batch into a single RPC call.
+
+        Bounded by epoch boundary, save_freq, test_freq, profiler boundaries,
+        total_training_steps, and max_ray_rpc_train_steps config.
+        """
+        max_ray_rpc_train_steps = int(getattr(self.config.trainer, "ray_rpc_train_steps", 1))
+        if max_ray_rpc_train_steps <= 1:
+            return 1
+
+        remaining = self.total_training_steps - global_step
+        num_steps = min(max_ray_rpc_train_steps, remaining)
+
+        # Break at epoch boundary to avoid partial dataloader fetches
+        steps_to_epoch_end = self.steps_per_epoch - (global_step % self.steps_per_epoch)
+        num_steps = min(num_steps, steps_to_epoch_end)
+
+        # Break at save/test boundaries
+        for freq in (self.save_freq, self.test_freq):
+            if freq > 0:
+                steps_to_boundary = freq - (global_step % freq)
+                num_steps = min(num_steps, steps_to_boundary)
+
+        # Break at profiler boundaries
+        if self.start_profile_step >= 0:
+            for profile_step in (self.start_profile_step, self.end_profile_step):
+                if global_step < profile_step:
+                    num_steps = min(num_steps, profile_step - global_step)
+
+        return max(1, num_steps)
+
+    def _interleave_batches(self, batches):
+        """Interleave N TensorDicts so DP chunking gives each worker the correct slice per step.
+
+        Input: N TensorDicts each with batch_size [B, ...]
+        Output: single TensorDict with batch_size [B*N, ...] where samples are interleaved
+                as [b0[0], b1[0], ..., bN[0], b0[1], b1[1], ..., bN[1], ...]
+        """
+        num_batches = len(batches)
+        if num_batches == 1:
+            return batches[0]
+
+        batch_size = batches[0].batch_size[0]
+        result = {}
+        for key, val in batches[0].items():
+            if not isinstance(val, torch.Tensor):
+                continue
+            if val.is_nested:
+                # Element-wise interleave for nested tensors (variable-length sequences).
+                elements = [batch[key][b] for b in range(batch_size) for batch in batches]
+                result[key] = torch.nested.as_nested_tensor(elements, layout=torch.jagged)
+            else:
+                # Stack/transpose/reshape for regular tensors.
+                stacked = torch.stack([b[key] for b in batches], dim=0)  # [N, B, ...]
+                interleaved = stacked.transpose(0, 1).reshape(-1, *stacked.shape[2:])  # [B*N, ...]
+                result[key] = interleaved
+
+        packed = TensorDict(result, batch_size=[batch_size * num_batches])
+        # Copy NonTensorData fields (meta_info) from the first batch.
+        # Re-wrap to avoid batch_size mismatch with packed.
+        for key, val in batches[0].items():
+            if not isinstance(val, torch.Tensor):
+                packed[key] = NonTensorData(val.data)
+        return packed
+
     def fit(self):
         tracking = Tracking(
             project_name=self.config.trainer.project_name,
@@ -285,58 +352,119 @@ class SFTTrainer:
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
 
-        train_time = 0
+        # ray_rpc_train_steps = 1 (default) uses train_batch directly without packing overhead;
+        # ray_rpc_train_steps > 1 (including 1.5) uses train_multi_batch.
+        ray_rpc_single_batch_mode = getattr(self.config.trainer, "ray_rpc_train_steps", 1) <= 1
+
+        total_driver_time = 0
+        total_worker_time = 0
         total_tokens = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
 
-            for step_in_epoch, data in enumerate(
-                tqdm(
-                    self.train_dataloader,
-                    initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
-                    total=self.steps_per_epoch,
-                    desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
-                )
-            ):
-                global_step += 1
-                # construct tensordict
-                data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
-                batch_seqlens = self._get_batch_seqlens(data=data).tolist()
-                # this is necessary. Otherwise, it is interpreted as NonTensorStack
-                batch_seqlens_ntd = NonTensorData(batch_seqlens)
+            dataloader_iter = iter(self.train_dataloader)
+            progress_bar = tqdm(
+                total=self.steps_per_epoch,
+                initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
+                desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
+            )
 
-                tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
+            while global_step < self.total_training_steps:
+                driver_start = time.perf_counter()
 
-                # start profile in SPMD mode
-                if global_step == self.start_profile_step:
-                    self.training_client.start_profile()
+                if ray_rpc_single_batch_mode:
+                    # Direct path: no packing/interleave overhead.
+                    try:
+                        data = next(dataloader_iter)
+                    except StopIteration:
+                        break
+                    data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
+                    all_batch_seqlens = [self._get_batch_seqlens(data=data).tolist()]
+                    # NonTensorData wrapping is necessary. Otherwise, it is interpreted as NonTensorStack.
+                    tu.assign_non_tensor(
+                        data,
+                        update_lr_scheduler=True,
+                        global_token_num=NonTensorData(all_batch_seqlens[0]),
+                    )
 
-                # train for on batch
-                output = self.training_client.train_batch(data)
-                output = output.get()
+                    if self.start_profile_step == global_step:
+                        self.training_client.start_profile()
+                    worker_start = time.perf_counter()
+                    output = self.training_client.train_batch(data).get()
+                    worker_time = time.perf_counter() - worker_start
 
-                if global_step == self.end_profile_step:
+                    actual_steps = 1
+
+                    all_metrics = [tu.get(output, "metrics")]
+                else:
+                    ray_rpc_train_steps = self._compute_ray_rpc_train_steps(global_step)
+
+                    # Prefetch N batches
+                    batches = []
+                    all_batch_seqlens = []
+                    for _ in range(ray_rpc_train_steps):
+                        try:
+                            data = next(dataloader_iter)
+                        except StopIteration:
+                            break
+                        data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
+                        batch_seqlens = self._get_batch_seqlens(data=data).tolist()
+                        batches.append(data)
+                        all_batch_seqlens.append(batch_seqlens)
+
+                    if not batches:
+                        break
+
+                    actual_steps = len(batches)
+
+                    # Interleave batches and send in one RPC (works for N=1 too)
+                    packed = self._interleave_batches(batches)
+                    # NonTensorData wrapping is necessary. Otherwise, it is interpreted as NonTensorStack.
+                    tu.assign_non_tensor(
+                        packed,
+                        update_lr_scheduler=True,
+                        num_steps=actual_steps,
+                        all_global_token_nums=NonTensorData(all_batch_seqlens),
+                    )
+
+                    # _compute_ray_rpc_train_steps breaks at profiler boundaries, so
+                    # global_step == start_profile_step at the start of the profiled RPC.
+                    if self.start_profile_step == global_step:
+                        self.training_client.start_profile()
+                    worker_start = time.perf_counter()
+                    output = self.training_client.train_multi_batch(packed).get()
+                    worker_time = time.perf_counter() - worker_start
+
+                    all_metrics = tu.get(output, "all_metrics")
+
+                if self.end_profile_step == global_step + actual_steps:
                     self.training_client.stop_profile()
 
-                metrics = tu.get(output, "metrics")
+                # Log metrics for each step (shared across both paths).
+                worker_time_per_step = worker_time / actual_steps
+                for i in range(actual_steps):
+                    global_step += 1
+                    metrics = all_metrics[i]
+                    metrics["train/loss"] = metrics.pop("loss")
+                    metrics["train/grad_norm"] = metrics.pop("grad_norm")
+                    metrics["train/lr"] = metrics.pop("lr")
+                    metrics["train/mfu"] = metrics.pop("mfu")
+                    metrics["train/time(s)"] = worker_time_per_step
+                    metrics["train/global_tokens"] = torch.sum(
+                        torch.tensor(all_batch_seqlens[i], device=self.device_name)
+                    ).item()
+                    total_tokens += metrics["train/global_tokens"]
+                    metrics["train/total_tokens(B)"] = total_tokens / 1e9
+                    tracking.log(data=metrics, step=global_step)
 
-                # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
-                metrics["train/loss"] = metrics.pop("loss")
-                metrics["train/grad_norm"] = metrics.pop("grad_norm")
-                metrics["train/lr"] = metrics.pop("lr")
-                metrics["train/mfu"] = metrics.pop("mfu")
-                metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
-                total_tokens += metrics["train/global_tokens"]
-                metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                tracking.log(data=metrics, step=global_step)
+                progress_bar.update(actual_steps)
 
                 is_last_step = global_step >= self.total_training_steps
-                is_valid_step = global_step % self.test_freq == 0
-                is_save_step = global_step % self.save_freq == 0
+                is_eval_step = self.test_freq > 0 and global_step % self.test_freq == 0
+                is_eval_step = self.val_dataloader is not None and (is_eval_step or is_last_step)
+                is_save_step = self.save_freq > 0 and global_step % self.save_freq == 0
 
-                # early exit or validation step
-                if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
-                    # Perform validation
+                if is_eval_step:
                     val_losses = []
                     for val_data in self.val_dataloader:
                         val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
@@ -351,13 +479,24 @@ class SFTTrainer:
                     tracking.log(data=metric, step=global_step)
                     last_valid_metric = metric
 
-                if is_last_step or (self.save_freq > 0 and is_save_step):
+                if is_last_step or is_save_step:
                     self.ckpt_handler.save_checkpoint(step=global_step)
 
+                driver_time = time.perf_counter() - driver_start
+                total_driver_time += driver_time
+                total_worker_time += worker_time
+
                 if is_last_step:
-                    print(f"Total time for train steps: {train_time:.2f}s")
+                    percent = total_worker_time / total_driver_time * 100 if total_driver_time > 0 else 0
+                    print(
+                        f"Total time for train steps: driver={total_driver_time:.2f}s,"
+                        f" worker={total_worker_time:.2f}s ({percent:.2f}%)."
+                    )
                     print(f"Final validation metrics: {last_valid_metric}")
+                    progress_bar.close()
                     return
+
+            progress_bar.close()
 
 
 def run_sft(config):
