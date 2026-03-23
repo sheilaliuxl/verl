@@ -16,6 +16,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -52,6 +53,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+KEY_ROUTING_ID = "routing_id"
 
 
 @ray.remote
@@ -62,8 +64,34 @@ class GlobalRequestLoadBalancer:
         if not server_actor_ids:
             raise ValueError("server_actor_ids must be non-empty")
 
+        self._server_ids = tuple(sorted(server_actor_ids))
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in server_actor_ids}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+
+    def pre_assign(self, routing_ids: list[str], uids: list[str]) -> None:
+        """Pre-assign requests to servers ensuring even distribution per prompt.
+
+        For each prompt (identified by uid), its N rollouts are round-robin
+        assigned across K servers, guaranteeing exactly N/K rollouts per server
+        per prompt. This eliminates random imbalance (e.g., 6-2 splits instead
+        of 4-4) that causes stragglers when a hard prompt's rollouts cluster
+        on one server.
+
+        Pre-assigned entries are placed in the sticky-session cache so that
+        subsequent acquire_server() calls respect the assignment.
+        """
+        num_servers = len(self._server_ids)
+        if num_servers == 0 or len(routing_ids) == 0:
+            return
+
+        # Group by uid, round-robin each prompt's rollouts across servers.
+        # Note: routing_ids (e.g. "__bal_0") are reused across steps;
+        # the assignment below overwrites any stale entries from prior steps.
+        uid_counters = defaultdict(int)
+        for i, uid in enumerate(uids):
+            server_idx = uid_counters[uid] % num_servers
+            uid_counters[uid] += 1
+            self._request_id_to_server[routing_ids[i]] = self._server_ids[server_idx]
 
     def acquire_server(self, request_id: str) -> str:
         """Acquire a server for the given request, reusing the same server for multi-turn conversations."""
@@ -353,6 +381,10 @@ class AgentLoopBase(ABC):
             prompt_ids = prompt_ids[len(self.system_prompt) :]
 
         return prompt_ids
+
+    def get_routing_id(self, kwargs: dict[str, Any]) -> str:
+        """Get routing_id from kwargs if pre-assigned, otherwise generate a fresh one."""
+        return kwargs.get(KEY_ROUTING_ID, uuid4().hex)
 
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -1014,6 +1046,27 @@ class AgentLoopManager:
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
 
+    def _pre_assign_balanced(self, prompts: DataProto) -> None:
+        """Pre-assign requests to servers ensuring even distribution per prompt.
+
+        Each prompt's N rollouts are round-robin distributed across K servers,
+        guaranteeing exactly N/K per server. This prevents random imbalance
+        (e.g., a hard prompt sending 6 of 8 rollouts to one server).
+        """
+        n = len(prompts)
+        if n == 0:
+            return
+
+        uids = prompts.non_tensor_batch.get("uid")
+        if uids is None:
+            return
+
+        routing_ids = [f"__bal_{i}" for i in range(n)]
+        prompts.non_tensor_batch[KEY_ROUTING_ID] = np.array(routing_ids, dtype=object)
+
+        # Pre-assign via load balancer (must complete before workers dispatch)
+        ray.get(self.global_load_balancer.pre_assign.remote(routing_ids, list(uids)))
+
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
@@ -1024,6 +1077,7 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        self._pre_assign_balanced(prompts)
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(

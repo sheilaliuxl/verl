@@ -14,7 +14,6 @@
 import logging
 import os
 from typing import Any
-from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
@@ -52,7 +51,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
-                request_id=uuid4().hex,
+                request_id=self.get_routing_id(kwargs),
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=images,

@@ -17,7 +17,6 @@ import logging
 import os
 from enum import Enum
 from typing import Any, Optional
-from uuid import uuid4
 
 import torch
 from PIL import Image
@@ -130,7 +129,7 @@ class ToolAgentLoop(AgentLoopBase):
         videos = multi_modal_data.get("videos")
 
         metrics = {}
-        request_id = uuid4().hex
+        request_id = self.get_routing_id(kwargs)
         tools_kwargs = kwargs.get("tools_kwargs", {})
 
         # Initialize interaction if needed
