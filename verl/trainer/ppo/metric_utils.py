@@ -31,7 +31,7 @@ KEY_ATTENTION_MASK = "attention_mask"
 KEY_FILTER_ZERO_ADV_CONFIG = "filter_zero_adv_config"
 KEY_NUM_SEQS_CORRECTION_FACTOR = "batch_num_seqs_correction_factor"
 KEY_NUM_TOKENS_CORRECTION_FACTOR = "batch_num_tokens_correction_factor"
-KEY_ORIGINAL_BATCH_SIZE = "original_batch_size"
+KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP = "original_batch_size_per_dp_group"
 KEY_RESPONSE_MASK = "response_mask"
 
 
@@ -111,7 +111,9 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int) -> tuple[DataProto, di
         filtered_batch = batch[selected]
         filtered_batch.meta_info.update(
             {
-                KEY_ORIGINAL_BATCH_SIZE: num_total,
+                KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP: (
+                    num_total // dp_size
+                ),  # per-GPU (matches normalized ppo_mini_batch_size)
                 # Loss normalization corrections: agg_loss divides by local token/seq count,
                 # but we need to normalize by the original (pre-filter) counts so the
                 # gradient magnitude matches the unfiltered baseline.

@@ -28,7 +28,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.trainer.ppo.metric_utils import KEY_FILTER_ZERO_ADV_CONFIG, KEY_ORIGINAL_BATCH_SIZE
+from verl.trainer.ppo.metric_utils import KEY_FILTER_ZERO_ADV_CONFIG, KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -553,17 +553,18 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
-        filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
-        # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE
+        _filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
+        # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
         # is not set — treat as if filter_zero_adv is off.
-        if filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE not in data.meta_info:
-            filter_zero_adv = False
+        filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
         match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
         if match_loss_curve:
             # Ghost optimizer.step() to preserve K when filter_zero_adv shrinks the batch.
             # This maintains the same number of optimizer updates as unfiltered training,
             # preserving momentum/Adam state evolution for a lossless convergence curve.
-            k_original = -(-data.meta_info[KEY_ORIGINAL_BATCH_SIZE] // self.config.ppo_mini_batch_size)  # ceil div
+            k_original = -(
+                -data.meta_info[KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP] // self.config.ppo_mini_batch_size
+            )  # ceil div
             num_ghost_opt_steps = max(0, k_original - len(mini_batches))
         else:
             # TODO: when match_loss_curve=False, apply token/seq correction factors
@@ -577,7 +578,7 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0,
             "actor/num_mini_batches": len(mini_batches),
         }
-        if filter_zero_adv:
+        if _filter_zero_adv:
             metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
