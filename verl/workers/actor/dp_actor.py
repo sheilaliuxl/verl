@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.metric_utils import KEY_FILTER_ZERO_ADV_CONFIG, KEY_ORIGINAL_BATCH_SIZE
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -551,12 +552,33 @@ class DataParallelPPOActor(BasePPOActor):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
+        filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
+        filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
+        # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE
+        # is not set — treat as if filter_zero_adv is off.
+        if filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE not in data.meta_info:
+            filter_zero_adv = False
+        match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
+        if match_loss_curve:
+            # Ghost optimizer.step() to preserve K when filter_zero_adv shrinks the batch.
+            # This maintains the same number of optimizer updates as unfiltered training,
+            # preserving momentum/Adam state evolution for a lossless convergence curve.
+            k_original = -(-data.meta_info[KEY_ORIGINAL_BATCH_SIZE] // self.config.ppo_mini_batch_size)  # ceil div
+            num_ghost_opt_steps = max(0, k_original - len(mini_batches))
+        else:
+            # TODO: when match_loss_curve=False, apply token/seq correction factors
+            # instead of ghost steps. To be addressed in a future PR.
+            num_ghost_opt_steps = 0
+
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
+            "actor/num_mini_batches": len(mini_batches),
         }
+        if filter_zero_adv:
+            metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -565,6 +587,11 @@ class DataParallelPPOActor(BasePPOActor):
                         mini_batch, max_token_len=max_token_len, dp_group=torch.distributed.group.WORLD
                     )
                 else:
+                    # GA uses the configured value even when filter_zero_adv shrinks the
+                    # last mini-batch. With match_loss_curve, the fewer real micro-batches
+                    # × same 1/GA produces a proportionally smaller gradient, matching the
+                    # unfiltered case where zero-adv micro-batches contribute ~0 gradient.
+                    # No additional scale factor is needed.
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
@@ -572,7 +599,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
@@ -643,6 +670,22 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
 
+                    # The last micro-batch can be partial when filter_zero_adv shrinks
+                    # the mini-batch. Correct pg_loss only — zero-adv sequences have ~0
+                    # policy gradient but non-zero entropy/KL. Full micro-batches and
+                    # ghost GA slots (handled by 1/GA) need no correction.
+                    # - seq-mean*: exact (denominator is num_seqs).
+                    # - token-mean: approximate (exact when response lengths are uniform).
+                    # Dynamic bsz self-corrects via m_j/mini_bs cancellation.
+                    if (
+                        match_loss_curve
+                        and not self.config.use_dynamic_bsz
+                        and micro_batch_idx == len(micro_batches) - 1
+                    ):
+                        actual_bs = response_mask.shape[0]
+                        if actual_bs < self.config.ppo_micro_batch_size_per_gpu:
+                            pg_loss = pg_loss * actual_bs / self.config.ppo_micro_batch_size_per_gpu
+
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -662,11 +705,8 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
-                    else:
-                        loss = policy_loss * loss_scale_factor
+                    loss = policy_loss * loss_scale_factor
+
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
@@ -678,5 +718,13 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+
+            # Ghost optimizer.step() calls for filtered-out mini-batches.
+            # Zero gradient → Adam momentum decays, preserving optimizer state evolution.
+            for _ in range(num_ghost_opt_steps):
+                self.actor_optimizer.zero_grad()
+                grad_norm = self._optimizer_step()
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
         self.actor_optimizer.zero_grad()
         return metrics
