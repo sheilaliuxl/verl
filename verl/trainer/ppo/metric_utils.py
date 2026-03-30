@@ -38,6 +38,19 @@ KEY_RESPONSE_MASK = "response_mask"
 ZERO_ADV_EPS = 1e-8
 
 
+def maybe_add_corrected_mfu(metrics: dict, meta_info: dict) -> None:
+    """Add corrected MFU metric when filter_zero_adv is active.
+
+    When filter_zero_adv is active, perf/mfu/actor is inflated because time is
+    reduced while FLOPS reflects only the filtered batch. This adds
+    perf/mfu/actor_corrected, normalized to the original batch for
+    apples-to-apples comparison with baseline.
+    """
+    token_correction = meta_info.get(KEY_NUM_TOKENS_CORRECTION_FACTOR, None)
+    if token_correction is not None:
+        metrics["perf/mfu/actor_corrected"] = metrics["perf/mfu/actor"] * token_correction
+
+
 def _select_shortest(batch: DataProto, indices: torch.Tensor, k: int) -> list[int]:
     """Select the k shortest samples by attention_mask length from the given indices."""
     seq_lens = batch.batch[KEY_ATTENTION_MASK][indices].sum(dim=-1)
