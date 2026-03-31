@@ -553,25 +553,24 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
-
         filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
         _filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
         # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
         # is not set — treat as if filter_zero_adv is off.
         filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
         match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
+
         if match_loss_curve:
-            # Compute original K to dry-run ghost optimizer.step() calls with zero
-            # gradients, maintaining the same number of Adam updates as baseline.
+            # Distribute filtered sequences evenly across K mini-batches
+            # (same K as baseline, capped by num_nonzero in filter_zero_adv_batch).
+            # Padding ensures divisibility by dp_size * K.
             k_original = -(
                 -data.meta_info[KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP] // self.config.ppo_mini_batch_size
             )  # ceil div
-            num_ghost_opt_steps = max(0, k_original - len(mini_batches))
+            even_mini_batch_size = max(1, -(-len(data) // k_original))  # ceil div
+            mini_batches = data.split(even_mini_batch_size)
         else:
-            # TODO: when match_loss_curve=False, apply token/seq correction factors
-            # instead of ghost steps. To be addressed in a future PR.
-            num_ghost_opt_steps = 0
+            mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
@@ -581,6 +580,11 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/num_mini_batches": len(mini_batches),
         }
         if _filter_zero_adv:
+            # How many fewer opt steps vs baseline (0 when match_loss_curve preserves K).
+            k_baseline = -(
+                -data.meta_info.get(KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP, len(data)) // self.config.ppo_mini_batch_size
+            )  # ceil div
+            num_ghost_opt_steps = k_baseline - len(mini_batches)
             metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -711,8 +715,9 @@ class DataParallelPPOActor(BasePPOActor):
 
             # Ghost optimizer.step() with zero gradients to maintain K
             # (the original number of optimizer steps per epoch).
+            # With match_loss_curve's even distribution, this is typically 0.
             if match_loss_curve:
-                for _ in range(num_ghost_opt_steps):
+                for _ in range(max(0, num_ghost_opt_steps)):
                     self.actor_optimizer.zero_grad()
                     grad_norm = self._optimizer_step()
                     append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})

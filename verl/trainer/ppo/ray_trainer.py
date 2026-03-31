@@ -1563,7 +1563,14 @@ class RayPPOTrainer:
                     actor_batch = batch
                     if self.config.algorithm.filter_zero_adv.enable:
                         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                        actor_batch, filter_metrics = filter_zero_adv_batch(batch, dp_size)
+                        ppo_mini_batch_size = (
+                            self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                            if self.config.algorithm.filter_zero_adv.match_loss_curve
+                            else 0
+                        )
+                        actor_batch, filter_metrics = filter_zero_adv_batch(
+                            batch, dp_size, ppo_mini_batch_size=ppo_mini_batch_size
+                        )
                         actor_batch.meta_info[KEY_FILTER_ZERO_ADV_CONFIG] = self.config.algorithm.filter_zero_adv
                         metrics.update(filter_metrics)
 

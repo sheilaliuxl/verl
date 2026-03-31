@@ -59,17 +59,23 @@ def _select_shortest(batch: DataProto, indices: torch.Tensor, k: int) -> list[in
     return indices[topk_idx].tolist()
 
 
-def filter_zero_adv_batch(batch: DataProto, dp_size: int) -> tuple[DataProto, dict]:
+def filter_zero_adv_batch(batch: DataProto, dp_size: int, ppo_mini_batch_size: int = 0) -> tuple[DataProto, dict]:
     """Filter out zero-advantage responses to skip wasted actor compute.
 
     Responses in all-same-reward groups have advantage≈0 and contribute no policy gradient.
-    Pads with shortest zero-adv samples to ensure divisibility by dp_size.
-    When all samples have zero advantage, keeps dp_size shortest samples so the
+    Pads with shortest zero-adv samples to ensure divisibility by the alignment unit.
+
+    When ppo_mini_batch_size > 0, pads to dp_size * K (K = original mini-batch count)
+    so sequences distribute evenly across DP groups and mini-batches. Otherwise
+    pads to dp_size only.
+
+    When all samples have zero advantage, keeps alignment-unit shortest samples so the
     optimizer/LR-scheduler still steps (gradients will be ~0).
 
     Args:
         batch: Full training batch with "advantages", "response_mask", "attention_mask".
         dp_size: Data parallel size for alignment.
+        ppo_mini_batch_size: Mini-batch size for K computation. 0 = pad to dp_size only.
 
     Returns:
         (filtered_batch, metrics): filtered_batch always has ≥ dp_size samples.
@@ -85,15 +91,24 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int) -> tuple[DataProto, di
     zero_idx_tensor = torch.where(~_nonzero_mask)[0]
     num_zeros = zero_idx_tensor.numel()
 
+    # Alignment unit: dp_size * K when distributing evenly across mini-batches,
+    # otherwise dp_size only. Capped by num_nonzero to ensure each mini-batch
+    # gets at least one nonzero sample per DP group.
+    if ppo_mini_batch_size > 0:
+        k_original = -(-num_total // ppo_mini_batch_size)  # ceil div
+        align = dp_size * min(k_original, num_nonzero)
+    else:
+        align = dp_size
+
     original_num_tokens = response_mask.sum().item()
     if original_num_tokens == 0:
         # Empty batch: skip filtering.
         selected = None
     elif num_nonzero == 0:
-        # All zero-adv: keep dp_size shortest for LR schedule continuity (~0 gradient).
-        selected = _select_shortest(batch, zero_idx_tensor, dp_size)
+        # All zero-adv: keep align shortest for LR schedule continuity (~0 gradient).
+        selected = _select_shortest(batch, zero_idx_tensor, align)
     else:
-        num_pad = (-num_nonzero) % dp_size
+        num_pad = (-num_nonzero) % align
         if num_zeros <= num_pad:
             # Not enough zero-adv samples to align — skip filtering, use full batch.
             selected = None
