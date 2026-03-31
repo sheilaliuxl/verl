@@ -39,6 +39,10 @@ KEY_RESPONSE_MASK = "response_mask"
 ZERO_ADV_EPS = 1e-8
 
 
+def ceildiv(a: int, b: int) -> int:
+    return -(-a // b)
+
+
 def maybe_add_corrected_mfu(metrics: dict, meta_info: dict) -> None:
     """Add corrected MFU metric when filter_zero_adv is active.
 
@@ -83,6 +87,7 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int, ppo_mini_batch_size: i
     response_mask = batch.batch[KEY_RESPONSE_MASK]
     max_abs_adv = (batch.batch[KEY_ADVANTAGES].abs() * response_mask).max(dim=-1).values
     num_total = max_abs_adv.numel()
+    bs_per_dp = ceildiv(num_total, dp_size)
 
     _nonzero_mask = max_abs_adv >= ZERO_ADV_EPS
     nonzero_indices = torch.where(_nonzero_mask)[0].tolist()
@@ -95,10 +100,11 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int, ppo_mini_batch_size: i
     # otherwise dp_size only. Capped by num_nonzero to ensure each mini-batch
     # gets at least one nonzero sample per DP group.
     if ppo_mini_batch_size > 0:
-        k_original = -(-num_total // ppo_mini_batch_size)  # ceil div
-        align = dp_size * min(k_original, num_nonzero)
+        k_original = ceildiv(bs_per_dp, ppo_mini_batch_size)
+        align_opt_steps = min(k_original, max(1, ceildiv(num_nonzero, dp_size)))
     else:
-        align = dp_size
+        align_opt_steps = 1
+    align = dp_size * align_opt_steps
 
     original_num_tokens = response_mask.sum().item()
     if original_num_tokens == 0:
@@ -127,9 +133,7 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int, ppo_mini_batch_size: i
         filtered_batch = batch[selected]
         filtered_batch.meta_info.update(
             {
-                KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP: (
-                    num_total // dp_size
-                ),  # per-GPU (matches normalized ppo_mini_batch_size)
+                KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP: bs_per_dp,  # per-GPU (matches ppo_mini_batch_size)
                 # Loss normalization corrections: agg_loss divides by local token/seq count,
                 # but we need to normalize by the original (pre-filter) counts so the
                 # gradient magnitude matches the unfiltered baseline.

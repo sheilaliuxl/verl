@@ -25,6 +25,7 @@ from verl.trainer.ppo.metric_utils import (
     KEY_NUM_TOKENS_CORRECTION_FACTOR,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
     ZERO_ADV_EPS,
+    ceildiv,
     filter_zero_adv_batch,
 )
 
@@ -69,6 +70,25 @@ def _make_batch(num_nonzero, num_zero, seq_len, attention_lengths=None):
         batch_size=(bs,),
     )
     return DataProto(batch=td)
+
+
+class TestCeildiv(unittest.TestCase):
+    @parameterized.expand(
+        (
+            (1, 1, 1),
+            (4, 2, 2),
+            (5, 2, 3),
+            (10, 3, 4),
+            (10, 4, 3),
+            (7, 1, 7),
+            (0, 5, 0),
+            (1, 5, 1),
+            (128, 128, 1),
+            (129, 128, 2),
+        )
+    )
+    def test_ceildiv(self, a, b, expected):
+        self.assertEqual(ceildiv(a, b), expected)
 
 
 class TestFilterZeroAdvBatch(unittest.TestCase):
@@ -148,7 +168,7 @@ class TestFilterZeroAdvBatch(unittest.TestCase):
     @parameterized.expand(
         (
             # (name, num_nz, num_z, seq, dp, kept, padded, orig_bs_per_dp, seq_corr, token_corr, avg_tokens_zero_adv)
-            ("6nz_4z_dp4", 6, 4, 4, 4, 8, 2, 2, 0.8, 0.8, 2.0),
+            ("6nz_4z_dp4", 6, 4, 4, 4, 8, 2, 3, 0.8, 0.8, 2.0),
             ("8nz_4z_dp4_aligned", 8, 4, 4, 4, 8, 0, 3, 2 / 3, 2 / 3, 4.0),
             ("3nz_7z_dp1", 3, 7, 4, 1, 3, 0, 10, 0.3, 0.3, 28.0),
             ("5nz_5z_dp2", 5, 5, 4, 2, 6, 1, 5, 0.6, 0.6, 8.0),

@@ -31,6 +31,7 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.metric_utils import (
     KEY_FILTER_ZERO_ADV_CONFIG,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
+    ceildiv,
 )
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
@@ -567,8 +568,8 @@ class DataParallelPPOActor(BasePPOActor):
             # Distribute filtered sequences evenly across K mini-batches
             # (same K as baseline, capped by num_nonzero in filter_zero_adv_batch).
             # Padding ensures divisibility by dp_size * K.
-            k_original = -(-original_bs // self.config.ppo_mini_batch_size)  # ceil div
-            even_mini_batch_size = max(1, -(-len(data) // k_original))  # ceil div
+            k_original = ceildiv(original_bs, self.config.ppo_mini_batch_size)
+            even_mini_batch_size = max(1, ceildiv(len(data), k_original))
             mini_batches = data.split(even_mini_batch_size)
         else:
             mini_batches = data.split(self.config.ppo_mini_batch_size)
@@ -582,7 +583,7 @@ class DataParallelPPOActor(BasePPOActor):
         }
         if _filter_zero_adv:
             # How many fewer opt steps vs baseline (0 when match_loss_curve preserves K).
-            k_baseline = -(-original_bs // self.config.ppo_mini_batch_size)  # ceil div
+            k_baseline = ceildiv(original_bs, self.config.ppo_mini_batch_size)
             num_ghost_opt_steps = k_baseline - len(mini_batches)
             metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
