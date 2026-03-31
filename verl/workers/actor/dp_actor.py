@@ -28,6 +28,10 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.metric_utils import (
+    KEY_FILTER_ZERO_ADV_CONFIG,
+    KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -551,12 +555,33 @@ class DataParallelPPOActor(BasePPOActor):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
+        filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
+        _filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
+        # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
+        # is not set — treat as if filter_zero_adv is off.
+        filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
+        match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
+        if match_loss_curve:
+            # Compute original K to dry-run ghost optimizer.step() calls with zero
+            # gradients, maintaining the same number of Adam updates as baseline.
+            k_original = -(
+                -data.meta_info[KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP] // self.config.ppo_mini_batch_size
+            )  # ceil div
+            num_ghost_opt_steps = max(0, k_original - len(mini_batches))
+        else:
+            # TODO: when match_loss_curve=False, apply token/seq correction factors
+            # instead of ghost steps. To be addressed in a future PR.
+            num_ghost_opt_steps = 0
+
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
+            "actor/num_mini_batches": len(mini_batches),
         }
+        if _filter_zero_adv:
+            metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -572,7 +597,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
@@ -585,10 +610,18 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
 
+                    # Weight each micro-batch so every sequence contributes
+                    # 1/mini_bs to the gradient regardless of micro-batch size.
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
+                        # Partial last micro-batch from filter_zero_adv: scale by
+                        # actual_bs/micro_bs so each seq still has equal weight.
+                        if filter_zero_adv and micro_batch_idx == len(micro_batches) - 1:
+                            actual_bs = response_mask.shape[0]
+                            if actual_bs < self.config.ppo_micro_batch_size_per_gpu:
+                                loss_scale_factor *= actual_bs / self.config.ppo_micro_batch_size_per_gpu
 
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
@@ -662,11 +695,8 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
-                    else:
-                        loss = policy_loss * loss_scale_factor
+                    loss = policy_loss * loss_scale_factor
+
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
@@ -678,5 +708,14 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+
+            # Ghost optimizer.step() with zero gradients to maintain K
+            # (the original number of optimizer steps per epoch).
+            if match_loss_curve:
+                for _ in range(num_ghost_opt_steps):
+                    self.actor_optimizer.zero_grad()
+                    grad_norm = self._optimizer_step()
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
         self.actor_optimizer.zero_grad()
         return metrics
