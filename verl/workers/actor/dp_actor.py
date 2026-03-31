@@ -27,11 +27,9 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import LOSS_AGG_TOKEN_MEAN, agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.metric_utils import (
     KEY_FILTER_ZERO_ADV_CONFIG,
-    KEY_NUM_SEQS_CORRECTION_FACTOR,
-    KEY_NUM_TOKENS_CORRECTION_FACTOR,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
     ceildiv,
 )
@@ -622,26 +620,17 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
-                        # Partial last micro-batch from filter_zero_adv (fewer-K path only):
-                        # when #opt steps < baseline, mini-batches may not divide evenly
-                        # into micro-batches. Scale by actual_bs/micro_bs so each seq
-                        # still has equal weight. Commented out: we keep the same K as
-                        # baseline (#non-zero < K is very unlikely), so this is dead code.
+                        # No extra correction needed for match_loss_curve: each sample's
+                        # weight is already 1/ppo_mini_batch_size (config) via
+                        # loss_scale_factor, for both dynamic and static BS paths.
+                        #
+                        # Partial last micro-batch (fewer-K path only): when #opt steps
+                        # < baseline, mini-batches may not divide evenly into micro-batches.
+                        # Scale by actual_bs/micro_bs so each seq still has equal weight.
                         # if filter_zero_adv and not match_loss_curve and micro_batch_idx == len(micro_batches) - 1:
                         #     actual_bs = response_mask.shape[0]
                         #     if actual_bs < self.config.ppo_micro_batch_size_per_gpu:
                         #         loss_scale_factor *= actual_bs / self.config.ppo_micro_batch_size_per_gpu
-
-                    # Correct for padding dilution: zero-adv padding samples inflate the
-                    # agg_loss denominator without contributing gradient. Scale loss so
-                    # effective normalization uses the original (pre-filter) batch size.
-                    if match_loss_curve:
-                        correction_key = (
-                            KEY_NUM_TOKENS_CORRECTION_FACTOR
-                            if loss_agg_mode == LOSS_AGG_TOKEN_MEAN
-                            else KEY_NUM_SEQS_CORRECTION_FACTOR
-                        )
-                        loss_scale_factor *= data.meta_info.get(correction_key, 1.0)
 
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
