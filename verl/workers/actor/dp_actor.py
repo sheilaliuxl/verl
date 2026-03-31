@@ -27,9 +27,11 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import LOSS_AGG_TOKEN_MEAN, agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.metric_utils import (
     KEY_FILTER_ZERO_ADV_CONFIG,
+    KEY_NUM_SEQS_CORRECTION_FACTOR,
+    KEY_NUM_TOKENS_CORRECTION_FACTOR,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
     ceildiv,
 )
@@ -631,6 +633,19 @@ class DataParallelPPOActor(BasePPOActor):
                         #     actual_bs = response_mask.shape[0]
                         #     if actual_bs < self.config.ppo_micro_batch_size_per_gpu:
                         #         loss_scale_factor *= actual_bs / self.config.ppo_micro_batch_size_per_gpu
+
+                    # Token-density correction for filter_zero_adv with token_mean:
+                    # loss_scale_factor already corrects for sample count, but token_mean
+                    # normalizes by total tokens. Removing zero-adv samples (often long
+                    # all-wrong responses) changes the avg tokens/seq, inflating the
+                    # per-sample gradient. Correct by the token-density ratio
+                    # (tokens_correction / seqs_correction) so the effective denominator
+                    # matches the original batch's token density.
+                    if match_loss_curve and loss_agg_mode == LOSS_AGG_TOKEN_MEAN:
+                        token_corr = data.meta_info.get(KEY_NUM_TOKENS_CORRECTION_FACTOR, 1.0)
+                        seq_corr = data.meta_info.get(KEY_NUM_SEQS_CORRECTION_FACTOR, 1.0)
+                        if seq_corr > 0:
+                            loss_scale_factor *= token_corr / seq_corr
 
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
