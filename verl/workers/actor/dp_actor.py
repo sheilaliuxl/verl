@@ -51,6 +51,50 @@ from verl.workers.config import ActorConfig
 __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
+
+
+@GPUMemoryLogger(role="dp actor", logger=logger)
+def _split_filter_zero_adv_mini_batches(
+    data: DataProto,
+    ppo_mini_batch_size: int,
+) -> tuple[list[DataProto], bool, bool, int, dict]:
+    """Split data into mini-batches, accounting for filter_zero_adv.
+
+    Returns:
+        (mini_batches, filter_zero_adv, match_loss_curve, num_ghost_opt_steps, metrics)
+    """
+    filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
+    _filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
+
+    # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
+    # is not set — treat as if filter_zero_adv is off.
+    filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
+    match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
+
+    # Original per-DP-group batch size (before filter_zero_adv), for K computation.
+    original_bs = data.meta_info.get(KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP, len(data))
+
+    if match_loss_curve:
+        # Distribute filtered sequences evenly across K mini-batches
+        # (same K as baseline, capped by num_nonzero in filter_zero_adv_batch).
+        # Padding ensures divisibility by dp_size * K.
+        k_original = ceildiv(original_bs, ppo_mini_batch_size)
+        even_mini_batch_size = max(1, ceildiv(len(data), k_original))
+        mini_batches = data.split(even_mini_batch_size)
+    else:
+        mini_batches = data.split(ppo_mini_batch_size)
+
+    metrics = {"actor/num_mini_batches": len(mini_batches)}
+    num_ghost_opt_steps = 0
+    if _filter_zero_adv:
+        # How many fewer opt steps vs baseline (0 when match_loss_curve preserves K).
+        k_baseline = ceildiv(original_bs, ppo_mini_batch_size)
+        num_ghost_opt_steps = k_baseline - len(mini_batches)
+        metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
+
+    return mini_batches, filter_zero_adv, match_loss_curve, num_ghost_opt_steps, metrics
+
+
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
@@ -556,38 +600,17 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
-        _filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
-        # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
-        # is not set — treat as if filter_zero_adv is off.
-        filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
-        match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
-
-        # Original per-DP-group batch size (before filter_zero_adv), for K computation.
-        original_bs = data.meta_info.get(KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP, len(data))
-
-        if match_loss_curve:
-            # Distribute filtered sequences evenly across K mini-batches
-            # (same K as baseline, capped by num_nonzero in filter_zero_adv_batch).
-            # Padding ensures divisibility by dp_size * K.
-            k_original = ceildiv(original_bs, self.config.ppo_mini_batch_size)
-            even_mini_batch_size = max(1, ceildiv(len(data), k_original))
-            mini_batches = data.split(even_mini_batch_size)
-        else:
-            mini_batches = data.split(self.config.ppo_mini_batch_size)
+        mini_batches, _, match_loss_curve, num_ghost_opt_steps, split_metrics = _split_filter_zero_adv_mini_batches(
+            data, self.config.ppo_mini_batch_size
+        )
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
-            "actor/num_mini_batches": len(mini_batches),
+            **split_metrics,
         }
-        if _filter_zero_adv:
-            # How many fewer opt steps vs baseline (0 when match_loss_curve preserves K).
-            k_baseline = ceildiv(original_bs, self.config.ppo_mini_batch_size)
-            num_ghost_opt_steps = k_baseline - len(mini_batches)
-            metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -596,10 +619,17 @@ class DataParallelPPOActor(BasePPOActor):
                         mini_batch, max_token_len=max_token_len, dp_group=torch.distributed.group.WORLD
                     )
                 else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    if match_loss_curve:
+                        # Use config GA so each sample weighs 1/ppo_mini_batch_size,
+                        # matching baseline per-sample gradient.
+                        self.gradient_accumulation = (
+                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        )
+                    else:
+                        # Use actual micro-batch count: naturally handles partial last
+                        # mini-batch in the fewer-K path without extra correction.
+                        self.gradient_accumulation = len(micro_batches)
 
                 self.actor_optimizer.zero_grad()
 
@@ -622,17 +652,10 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
-                        # No extra correction needed for match_loss_curve: each sample's
-                        # weight is already 1/ppo_mini_batch_size (config) via
-                        # loss_scale_factor, for both dynamic and static BS paths.
-                        #
-                        # Partial last micro-batch (fewer-K path only): when #opt steps
-                        # < baseline, mini-batches may not divide evenly into micro-batches.
-                        # Scale by actual_bs/micro_bs so each seq still has equal weight.
-                        # if filter_zero_adv and not match_loss_curve and micro_batch_idx == len(micro_batches) - 1:
-                        #     actual_bs = response_mask.shape[0]
-                        #     if actual_bs < self.config.ppo_micro_batch_size_per_gpu:
-                        #         loss_scale_factor *= actual_bs / self.config.ppo_micro_batch_size_per_gpu
+                        # match_loss_curve: each sample weighs 1/ppo_mini_batch_size
+                        # (config) via loss_scale_factor, matching baseline.
+                        # fewer-K: GA = len(micro_batches) naturally handles partial
+                        # last mini-batch without extra correction.
 
                     # Token-density correction for filter_zero_adv with token_mean:
                     # loss_scale_factor already corrects for sample count, but token_mean
