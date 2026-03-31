@@ -169,11 +169,6 @@ def validate_config(
     if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
         print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
-    if config.algorithm.filter_zero_adv.enable and not config.algorithm.filter_zero_adv.match_loss_curve:
-        raise ValueError(
-            "filter_zero_adv.match_loss_curve must be True for now. Non-matching mode will be addressed in a future PR."
-        )
-
     if config.algorithm.filter_zero_adv.enable and (
         config.actor_rollout_ref.actor.use_kl_loss and config.actor_rollout_ref.actor.kl_loss_coef != 0
     ):
