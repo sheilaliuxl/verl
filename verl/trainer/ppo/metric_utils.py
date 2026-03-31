@@ -31,6 +31,7 @@ KEY_ATTENTION_MASK = "attention_mask"
 KEY_FILTER_ZERO_ADV_CONFIG = "filter_zero_adv_config"
 KEY_NUM_SEQS_CORRECTION_FACTOR = "batch_num_seqs_correction_factor"
 KEY_NUM_TOKENS_CORRECTION_FACTOR = "batch_num_tokens_correction_factor"
+KEY_AVG_TOKENS_ZERO_ADV_PER_DP_GROUP = "avg_tokens_zero_adv_per_dp_group"
 KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP = "original_batch_size_per_dp_group"
 KEY_RESPONSE_MASK = "response_mask"
 
@@ -119,6 +120,9 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int) -> tuple[DataProto, di
                 # gradient magnitude matches the unfiltered baseline.
                 KEY_NUM_TOKENS_CORRECTION_FACTOR: (
                     filtered_batch.batch[KEY_RESPONSE_MASK].sum().item() / original_num_tokens
+                ),
+                KEY_AVG_TOKENS_ZERO_ADV_PER_DP_GROUP: (
+                    (original_num_tokens - filtered_batch.batch[KEY_RESPONSE_MASK].sum().item()) / dp_size
                 ),
                 KEY_NUM_SEQS_CORRECTION_FACTOR: num_selected / num_total,
             }

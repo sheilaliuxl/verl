@@ -27,8 +27,12 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.trainer.ppo.metric_utils import KEY_FILTER_ZERO_ADV_CONFIG, KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
+from verl.trainer.ppo.core_algos import LOSS_AGG_TOKEN_MEAN, agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.metric_utils import (
+    KEY_AVG_TOKENS_ZERO_ADV_PER_DP_GROUP,
+    KEY_FILTER_ZERO_ADV_CONFIG,
+    KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -675,8 +679,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # the mini-batch. Correct pg_loss only — zero-adv sequences have ~0
                     # policy gradient but non-zero entropy/KL. Full micro-batches and
                     # ghost GA slots (handled by 1/GA) need no correction.
-                    # - seq-mean*: exact (denominator is num_seqs).
-                    # - token-mean: approximate (exact when response lengths are uniform).
+                    # - seq-mean*: exact via seq-based correction (denominator is num_seqs).
+                    # - token-mean: better approximation via token-based correction when
+                    #   K=1 and GA unchanged — "as if" all zero-adv tokens are in the last
+                    #   micro-batch. Exact globally, approximate per-GPU (avg across DP groups).
                     # Dynamic bsz self-corrects via m_j/mini_bs cancellation.
                     if (
                         match_loss_curve
@@ -685,7 +691,21 @@ class DataParallelPPOActor(BasePPOActor):
                     ):
                         actual_bs = response_mask.shape[0]
                         if actual_bs < self.config.ppo_micro_batch_size_per_gpu:
-                            pg_loss = pg_loss * actual_bs / self.config.ppo_micro_batch_size_per_gpu
+                            if (
+                                loss_agg_mode == LOSS_AGG_TOKEN_MEAN
+                                and len(micro_batches) == self.gradient_accumulation
+                            ):
+                                # Per-GPU missing tokens from zero-adv filtering.
+                                # When K=1 and GA is unchanged, all zero-adv tokens
+                                # conceptually concentrate in the last micro-batch
+                                # ("as if" rearrangement). Averaged across DP groups;
+                                # exact globally, approximate per-GPU due to load balancing.
+                                actual_tokens = response_mask.sum()
+                                pg_loss *= actual_tokens / (
+                                    actual_tokens + data.meta_info[KEY_AVG_TOKENS_ZERO_ADV_PER_DP_GROUP]
+                                )
+                            else:
+                                pg_loss *= actual_bs / self.config.ppo_micro_batch_size_per_gpu
 
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:
