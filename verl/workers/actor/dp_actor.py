@@ -560,13 +560,14 @@ class DataParallelPPOActor(BasePPOActor):
         filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
         match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
 
+        # Original per-DP-group batch size (before filter_zero_adv), for K computation.
+        original_bs = data.meta_info.get(KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP, len(data))
+
         if match_loss_curve:
             # Distribute filtered sequences evenly across K mini-batches
             # (same K as baseline, capped by num_nonzero in filter_zero_adv_batch).
             # Padding ensures divisibility by dp_size * K.
-            k_original = -(
-                -data.meta_info[KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP] // self.config.ppo_mini_batch_size
-            )  # ceil div
+            k_original = -(-original_bs // self.config.ppo_mini_batch_size)  # ceil div
             even_mini_batch_size = max(1, -(-len(data) // k_original))  # ceil div
             mini_batches = data.split(even_mini_batch_size)
         else:
@@ -581,9 +582,7 @@ class DataParallelPPOActor(BasePPOActor):
         }
         if _filter_zero_adv:
             # How many fewer opt steps vs baseline (0 when match_loss_curve preserves K).
-            k_baseline = -(
-                -data.meta_info.get(KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP, len(data)) // self.config.ppo_mini_batch_size
-            )  # ceil div
+            k_baseline = -(-original_bs // self.config.ppo_mini_batch_size)  # ceil div
             num_ghost_opt_steps = k_baseline - len(mini_batches)
             metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
         for _ in range(self.config.ppo_epochs):
