@@ -563,9 +563,10 @@ class DataParallelPPOActor(BasePPOActor):
         filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
         match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
         if match_loss_curve:
-            # Ghost optimizer.step() to preserve K when filter_zero_adv shrinks the batch.
-            # This maintains the same number of optimizer updates as unfiltered training,
-            # preserving momentum/Adam state evolution for a lossless convergence curve.
+            # Compute original K for metrics and partial micro-batch correction.
+            # Ghost optimizer.step() calls are intentionally skipped — they don't
+            # close the loss gap (proven at K=2) and risk reintroducing drift at
+            # high accuracy. The correction below handles the partial last micro-batch.
             k_original = -(
                 -data.meta_info[KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP] // self.config.ppo_mini_batch_size
             )  # ceil div
@@ -739,13 +740,6 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
-
-            # Ghost optimizer.step() calls for filtered-out mini-batches.
-            # Zero gradient → Adam momentum decays, preserving optimizer state evolution.
-            for _ in range(num_ghost_opt_steps):
-                self.actor_optimizer.zero_grad()
-                grad_norm = self._optimizer_step()
-                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         self.actor_optimizer.zero_grad()
         return metrics
