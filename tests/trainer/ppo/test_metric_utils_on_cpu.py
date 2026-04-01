@@ -23,6 +23,8 @@ import torch
 from parameterized import parameterized
 
 from verl.trainer.ppo.metric_utils import (
+    KEY_UID,
+    ZERO_ADV_EPS,
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
@@ -544,20 +546,34 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
 
 class TestZeroAdvMetrics(unittest.TestCase):
-    """Tests for zero-advantage metrics in compute_data_metrics."""
+    """Tests for zero-advantage metrics in compute_data_metrics.
 
-    def _make_batch(self, advantages):
+    Per-response metrics (zero_adv_count/ratio): based on advantage values.
+    Per-prompt metrics (zero_adv_pos/neg): group by UID, count all-correct (score > 0)
+    vs all-wrong (score <= 0) among zero-adv prompt groups.  Ratios are over
+    total number of prompts.  When no UID is provided, pos/neg default to 0.
+    """
+
+    def _make_batch(self, advantages, scores=None, uids=None):
         batch = MagicMock()
         bs, seq = advantages.shape
+        if scores is None:
+            token_level_scores = torch.ones(bs, seq)
+        else:
+            scores_t = torch.tensor(scores, dtype=torch.float32)
+            token_level_scores = torch.zeros(bs, seq)
+            token_level_scores[:, 0] = scores_t
         batch.batch = {
             "advantages": advantages,
             "attention_mask": torch.ones((bs, seq * 2)),
             "response_mask": torch.ones((bs, seq)),
             "responses": torch.zeros((bs, seq)),
             "returns": torch.ones((bs, seq)),
-            "token_level_rewards": torch.ones((bs, seq)),
-            "token_level_scores": torch.ones((bs, seq)),
+            "token_level_rewards": token_level_scores.clone(),
+            "token_level_scores": token_level_scores,
         }
+        if uids is not None:
+            batch.non_tensor_batch = {KEY_UID: np.array(uids, dtype=object)}
         return batch
 
     @parameterized.expand(
@@ -580,6 +596,75 @@ class TestZeroAdvMetrics(unittest.TestCase):
 
         self.assertEqual(metrics["critic/advantages/zero_adv_count"], expected_count)
         self.assertAlmostEqual(metrics["critic/advantages/zero_adv_ratio"], expected_ratio)
+        # Without uid, per-score-value metrics are absent.
+        zero_adv_score_keys = [k for k in metrics if "zero_adv_score_" in k]
+        self.assertEqual(zero_adv_score_keys, [])
+
+    @parameterized.expand(
+        (
+            # (name, scores, uids, exp_zero_count, exp_zero_ratio, exp_by_score, num_uniq_prompts)
+            # exp_by_score: {score_value: count_of_zero_adv_groups_with_that_score}
+            # Mix of sorted (contiguous) and interleaved UIDs to cover both layouts.
+            ("pos_and_mixed", (1, 1, 1, 0), ("A", "B", "A", "B"), 2, 0.5, {1: 1}, 2),
+            ("neg_and_mixed", (0, 0, 1, 0), ("A", "A", "B", "B"), 2, 0.5, {0: 1}, 2),
+            ("pos_neg_mixed", (1, 0, 1, 1, 0, 0), ("A", "B", "C", "A", "B", "C"), 4, 4.0 / 6, {0: 1, 1: 1}, 3),
+            ("all_pos", (1, 1, 1, 1), ("A", "A", "B", "B"), 4, 1.0, {1: 2}, 2),
+            ("all_neg", (0, 0, 0, 0), ("A", "B", "A", "B"), 4, 1.0, {0: 2}, 2),
+            ("all_mixed", (1, 1, 0, 0), ("A", "B", "A", "B"), 0, 0.0, {}, 2),
+            ("neg_scores", (-1, 1, -1, 1), ("A", "B", "A", "B"), 4, 1.0, {-1: 1, 1: 1}, 2),
+            ("n4_all_correct", (1, 1, 1, 1), ("A", "A", "A", "A"), 4, 1.0, {1: 1}, 1),
+            ("singleton", (1, 0, 0), ("A", "B", "B"), 3, 1.0, {0: 1}, 2),
+        )
+    )
+    def test_zero_adv_with_uid(
+        self, _name, scores, uids, exp_zero_count, exp_zero_ratio, exp_by_score, num_uniq_prompts
+    ):
+        # Derive advantages from GRPO grouping: adv=0 when all scores in a uid group are identical.
+        bs = len(scores)
+        seq = 2
+        uid2scores = {}
+        for i, uid in enumerate(uids):
+            uid2scores.setdefault(uid, []).append(scores[i])
+        advantages = torch.zeros(bs, seq)
+        for i, uid in enumerate(uids):
+            group = uid2scores[uid]
+            if len(group) > 1 and max(group) - min(group) >= ZERO_ADV_EPS:
+                advantages[i] = 1.0
+        batch = self._make_batch(advantages, scores=scores, uids=uids)
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        self.assertEqual(metrics["critic/advantages/zero_adv_count"], exp_zero_count)
+        self.assertAlmostEqual(metrics["critic/advantages/zero_adv_ratio"], exp_zero_ratio)
+        # Per-score-value metrics: verify expected entries and no extras.
+        score_metric_keys = [k for k in metrics if "zero_adv_score_" in k]
+        expected_keys = []
+        for score_val, expected_count in exp_by_score.items():
+            key = f"critic/advantages/zero_adv_score_{score_val:g}"
+            expected_keys.extend([f"{key}_count", f"{key}_ratio"])
+            self.assertEqual(metrics[f"{key}_count"], expected_count)
+            self.assertAlmostEqual(metrics[f"{key}_ratio"], expected_count / num_uniq_prompts)
+        self.assertEqual(sorted(score_metric_keys), sorted(expected_keys))
+
+    def test_zero_adv_with_uid_many_uniq_scores(self):
+        """When there are more than ZERO_ADV_MAX_UNIQ_SCORES unique score values,
+        per-score-value metrics are absent."""
+        # 11 prompts × 2 responses each, all zero_adv (identical scores within group).
+        # Each prompt has a different score value → 11 unique scores > MAX_UNIQ_SCORES=10.
+        n = 11
+        scores = []
+        uids = []
+        for i in range(n):
+            scores.extend([float(i), float(i)])
+            uids.extend([str(i), str(i)])
+        bs = len(scores)
+        seq = 2
+        advantages = torch.zeros(bs, seq)  # all zero_adv
+        batch = self._make_batch(advantages, scores=scores, uids=uids)
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        self.assertEqual(metrics["critic/advantages/zero_adv_count"], bs)
+        zero_adv_score_keys = [k for k in metrics if "zero_adv_score_" in k]
+        self.assertEqual(zero_adv_score_keys, [])
 
 
 if __name__ == "__main__":
