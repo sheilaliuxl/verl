@@ -26,7 +26,9 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
+KEY_UID = "uid"
 ZERO_ADV_EPS = 1e-8
+ZERO_ADV_MAX_UNIQ_SCORES = 10
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -142,6 +144,29 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     max_abs_adv = (advantages.abs() * response_mask).max(dim=-1).values  # (bs,)
     num_zero_adv = (max_abs_adv < ZERO_ADV_EPS).sum().item()
     num_responses = max_abs_adv.numel()
+
+    # Per-prompt zero-advantage breakdown by score value.
+    # A prompt group is "zero_adv" when all its responses have the same score (std=0 => adv=0).
+    # If scores are discrete (fewer than ZERO_ADV_MAX_UNIQ_SCORES unique values), emit
+    # per-value counts: zero_adv_score_{value}_count/ratio.
+    zero_adv_metrics = {}
+    if KEY_UID in batch.non_tensor_batch:
+        uid2scores = defaultdict(list)
+        for i, uid in enumerate(batch.non_tensor_batch[KEY_UID]):
+            uid2scores[uid].append(sequence_score[i].item())
+        num_uniq_prompts = len(uid2scores)
+        # Collect the score value for each zero_adv prompt group.
+        zero_adv_group_scores = []
+        for scores in uid2scores.values():
+            if len(scores) > 1 and max(scores) - min(scores) < ZERO_ADV_EPS:
+                zero_adv_group_scores.append(scores[0])
+        # Count by score value if discrete (few unique values among zero_adv groups).
+        if len(set(zero_adv_group_scores)) <= ZERO_ADV_MAX_UNIQ_SCORES:
+            for score_val in sorted(set(zero_adv_group_scores)):
+                count = zero_adv_group_scores.count(score_val)
+                key = f"critic/advantages/zero_adv_score_{score_val:g}"
+                zero_adv_metrics[f"{key}_count"] = count
+                zero_adv_metrics[f"{key}_ratio"] = count / num_uniq_prompts if num_uniq_prompts > 0 else 0.0
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
@@ -178,6 +203,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
         "critic/advantages/zero_adv_count": num_zero_adv,
         "critic/advantages/zero_adv_ratio": num_zero_adv / num_responses if num_responses > 0 else 0.0,
+        **zero_adv_metrics,
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
