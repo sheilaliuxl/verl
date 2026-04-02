@@ -17,7 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -33,7 +33,9 @@ KEY_NUM_SEQS_CORRECTION_FACTOR = "batch_num_seqs_correction_factor"
 KEY_NUM_TOKENS_CORRECTION_FACTOR = "batch_num_tokens_correction_factor"
 KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP = "original_batch_size_per_dp_group"
 KEY_RESPONSE_MASK = "response_mask"
+KEY_TOKEN_LEVEL_SCORES = "token_level_scores"
 KEY_UID = "uid"
+KEY_ZERO_ADV_KL_MASK = "zero_adv_kl_mask"
 
 
 ZERO_ADV_EPS = 1e-8
@@ -42,6 +44,99 @@ ZERO_ADV_MAX_UNIQ_SCORES = 10
 
 def ceildiv(a: int, b: int) -> int:
     return -(-a // b)
+
+
+def max_abs_advantage(advantages: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Per-response maximum absolute advantage (masked). Shape: (batch_size,)."""
+    return (advantages.abs() * response_mask).max(dim=-1).values
+
+
+class KLConfig(NamedTuple):
+    """Configuration for one KL loss term in the actor update loop."""
+
+    idx: Optional[torch.Tensor]
+    ref_key_for_log_prob: str
+    kl_type: str
+    kl_coeff: float
+    metric_key: str
+
+
+def build_kl_loss_configs(
+    kl_loss_type: str,
+    kl_loss_coeff: float,
+    kl_loss_type_za: str,
+    kl_loss_coeff_za: float,
+    za_kl_mask: Optional[torch.Tensor],
+) -> list[KLConfig]:
+    """Build KL loss configs for the actor update loop.
+
+    Splits samples so that regular KL excludes all-wrong zero-adv samples
+    (avoids accidentally anchoring them with positive beta).
+
+    Args:
+        kl_loss_type: KL penalty type for regular KL.
+        kl_loss_coeff: Coefficient for regular KL (0 = disabled).
+        kl_loss_type_za: KL penalty type for zero-adv KL.
+        kl_loss_coeff_za: Coefficient for zero-adv repulsive KL (expected non-positive).
+        za_kl_mask: Boolean mask where True = all-wrong zero-adv sample, or None.
+
+    Returns:
+        List of KLConfig entries to iterate over.
+    """
+    za_active = za_kl_mask is not None and za_kl_mask.any()
+    configs: list[KLConfig] = []
+
+    if kl_loss_coeff != 0:
+        non_za_idx = (~za_kl_mask).nonzero(as_tuple=True)[0] if za_active else None
+        configs.append(KLConfig(non_za_idx, "ref_log_prob", kl_loss_type, kl_loss_coeff, "actor/kl_loss"))
+
+    if kl_loss_coeff_za != 0 and za_active:
+        za_idx = za_kl_mask.nonzero(as_tuple=True)[0]
+        configs.append(KLConfig(za_idx, "old_log_probs", kl_loss_type_za, kl_loss_coeff_za, "actor/kl_loss_zero_adv"))
+
+    return configs
+
+
+def compute_zero_adv_kl_mask(batch: DataProto, threshold: float = 0.0) -> torch.Tensor | None:
+    """Compute per-sample mask identifying all-wrong zero-adv groups for repulsive KL.
+
+    A zero-adv group is "all-wrong" if all its members have the same score
+    (advantage = 0) and that score is at or below ``threshold``.
+
+    Args:
+        batch: Training batch with advantages, token_level_scores, response_mask, and uid.
+        threshold: Score threshold. Groups with max(score) <= threshold are all-wrong.
+
+    Returns:
+        Boolean tensor of shape ``(batch_size,)`` where True = all-wrong zero-adv sample,
+        or None if uid is not available.
+    """
+    if KEY_UID not in batch.non_tensor_batch:
+        return None
+
+    response_mask = batch.batch[KEY_RESPONSE_MASK]
+    advantages = batch.batch[KEY_ADVANTAGES]
+
+    _max_abs_adv = max_abs_advantage(advantages, response_mask)
+    is_zero_adv = _max_abs_adv < ZERO_ADV_EPS
+
+    uids = batch.non_tensor_batch[KEY_UID]
+    scores = (batch.batch[KEY_TOKEN_LEVEL_SCORES] * response_mask).sum(dim=-1)
+    all_wrong_uids: set[str] = set()
+    uid_has_nonzero: set[str] = set()
+    for i, uid in enumerate(uids):
+        if not is_zero_adv[i]:
+            all_wrong_uids.discard(uid)
+            uid_has_nonzero.add(uid)
+        elif uid not in uid_has_nonzero and scores[i].item() <= threshold:
+            all_wrong_uids.add(uid)
+
+    if not all_wrong_uids:
+        return None
+
+    # Vectorized mask for samples belonging to all-wrong zero-adv uids.
+    mask = np.isin(uids, list(all_wrong_uids))
+    return torch.from_numpy(mask).to(device=advantages.device)
 
 
 def maybe_add_corrected_mfu(metrics: dict, meta_info: dict) -> None:
@@ -88,11 +183,17 @@ def filter_zero_adv_batch(batch: DataProto, dp_size: int, ppo_mini_batch_size: i
         (filtered_batch, metrics): filtered_batch always has ≥ dp_size samples.
     """
     response_mask = batch.batch[KEY_RESPONSE_MASK]
-    max_abs_adv = (batch.batch[KEY_ADVANTAGES].abs() * response_mask).max(dim=-1).values
+    max_abs_adv = max_abs_advantage(batch.batch[KEY_ADVANTAGES], response_mask)
     num_total = max_abs_adv.numel()
     bs_per_dp = ceildiv(num_total, dp_size)
 
     _nonzero_mask = max_abs_adv >= ZERO_ADV_EPS
+
+    # Keep all-wrong zero-adv samples for repulsive KL (treat them as "nonzero").
+    zero_adv_kl_mask = batch.batch.get(KEY_ZERO_ADV_KL_MASK, None)
+    if zero_adv_kl_mask is not None:
+        _nonzero_mask = _nonzero_mask | zero_adv_kl_mask
+
     nonzero_indices = torch.where(_nonzero_mask)[0].tolist()
     num_nonzero = len(nonzero_indices)
 
@@ -268,7 +369,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_returns = torch.masked_select(returns, response_mask)
 
     # Per-response zero-advantage ratio: responses whose advantage is zero contribute no policy gradient.
-    max_abs_adv = (advantages.abs() * response_mask).max(dim=-1).values  # (bs,)
+    max_abs_adv = max_abs_advantage(advantages, response_mask)  # (bs,)
     num_zero_adv = (max_abs_adv < ZERO_ADV_EPS).sum().item()
     num_responses = max_abs_adv.numel()
 

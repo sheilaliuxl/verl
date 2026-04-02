@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from verl.trainer.config.algorithm import DEFAULT_ZERO_ADV_KL_LOSS_TYPE
+
 __all__ = ["omega_conf_to_dataclass", "validate_config"]
 
 
@@ -169,23 +171,38 @@ def validate_config(
     if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
         print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
-    if config.algorithm.filter_zero_adv.enable and (
+    _filter_zero_adv = config.algorithm.filter_zero_adv
+    if _filter_zero_adv.enable and (
         config.actor_rollout_ref.actor.use_kl_loss and config.actor_rollout_ref.actor.kl_loss_coef != 0
     ):
         raise ValueError(
             "algorithm.filter_zero_adv and actor KL loss (use_kl_loss=True, kl_loss_coef != 0)"
             " cannot both be enabled — zero-adv samples still contribute to KL loss."
         )
-    if config.algorithm.filter_zero_adv.enable and config.actor_rollout_ref.actor.entropy_coeff != 0:
+    if _filter_zero_adv.enable and config.actor_rollout_ref.actor.entropy_coeff != 0:
         raise ValueError(
             "algorithm.filter_zero_adv and actor.entropy_coeff != 0 cannot both be True"
             " — zero-adv samples still contribute non-zero entropy gradient."
         )
-    if config.algorithm.filter_zero_adv.enable and config.actor_rollout_ref.actor.calculate_entropy:
+    if _filter_zero_adv.enable and config.actor_rollout_ref.actor.calculate_entropy:
         print(
             "WARNING: filter_zero_adv with calculate_entropy=True — actor/entropy metric"
             " is computed on the filtered batch only, not the full batch."
         )
+
+    kl_coef_za = _filter_zero_adv.get("all_negative_prompt_kl_coeff", 0.0)
+    if _filter_zero_adv.enable and kl_coef_za != 0:
+        if kl_coef_za > 0:
+            print(
+                "WARNING: filter_zero_adv.all_negative_prompt_kl_coeff > 0 (anchoring direction)."
+                " Expected non-positive for repulsive KL. Positive values are for ablation only."
+            )
+        kl_type_za = _filter_zero_adv.get("kl_loss_type", DEFAULT_ZERO_ADV_KL_LOSS_TYPE)
+        if kl_type_za in ("kl", "k1"):
+            raise ValueError(
+                f"filter_zero_adv.kl_loss_type='{kl_type_za}' is directional (can be negative)"
+                " — use a symmetric type ('low_var_kl', 'mse', 'abs') for repulsive KL."
+            )
 
     # critic
     if use_critic:

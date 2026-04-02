@@ -26,10 +26,12 @@ from verl.trainer.ppo.metric_utils import (
     KEY_UID,
     ZERO_ADV_EPS,
     bootstrap_metric,
+    build_kl_loss_configs,
     calc_maj_val,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_zero_adv_kl_mask,
     process_validation_metrics,
 )
 from verl.utils.metric import (
@@ -665,6 +667,139 @@ class TestZeroAdvMetrics(unittest.TestCase):
         self.assertEqual(metrics["critic/advantages/zero_adv_count"], bs)
         zero_adv_score_keys = [k for k in metrics if "zero_adv_score_" in k]
         self.assertEqual(zero_adv_score_keys, [])
+
+
+class TestZeroAdvKlMask(unittest.TestCase):
+    """Tests for compute_zero_adv_kl_mask."""
+
+    def _make_batch(self, scores, uids, seq=2):
+        """Build a DataProto-like mock with GRPO-style advantages from scores+uids."""
+        batch = MagicMock()
+        bs = len(scores)
+        scores_t = torch.tensor(scores, dtype=torch.float32)
+        token_level_scores = torch.zeros(bs, seq)
+        token_level_scores[:, 0] = scores_t
+        response_mask = torch.ones(bs, seq)
+
+        # Derive advantages: zero when all scores in a uid group are identical.
+        uid2scores = {}
+        for i, uid in enumerate(uids):
+            uid2scores.setdefault(uid, []).append(scores[i])
+        advantages = torch.zeros(bs, seq)
+        for i, uid in enumerate(uids):
+            group = uid2scores[uid]
+            if len(group) > 1 and max(group) - min(group) >= ZERO_ADV_EPS:
+                advantages[i] = 1.0
+
+        batch.batch = {
+            "advantages": advantages,
+            "response_mask": response_mask,
+            "token_level_scores": token_level_scores,
+        }
+        batch.non_tensor_batch = {KEY_UID: np.array(uids, dtype=object)}
+        return batch
+
+    @parameterized.expand(
+        (
+            ("wrong_and_mixed", (0, 0, 1, 0), ("A", "A", "B", "B"), 0.0, (True, True, False, False)),
+            ("both_wrong", (0, 0, 0, 0), ("A", "A", "B", "B"), 0.0, (True, True, True, True)),
+            ("all_correct", (1, 1, 1, 1), ("A", "A", "B", "B"), 0.0, None),
+            ("all_mixed", (0, 1, 0, 1), ("A", "A", "B", "B"), 0.0, None),
+            ("neg_scores", (-1, -1, 1, 1), ("A", "A", "B", "B"), 0.0, (True, True, False, False)),
+            ("custom_threshold", (0.3, 0.3, 1, 1), ("A", "A", "B", "B"), 0.5, (True, True, False, False)),
+            ("interleaved", (0, 1, 0, 0), ("A", "B", "A", "B"), 0.0, (True, False, True, False)),
+            ("singleton", (0, 1, 1), ("A", "B", "B"), 0.0, (True, False, False)),
+            (
+                "three_groups",
+                (0, 0, 1, 1, 1, 0),
+                ("A", "A", "B", "B", "C", "C"),
+                0.0,
+                (True, True, False, False, False, False),
+            ),
+        )
+    )
+    def test_zero_adv_kl_mask(self, _name, scores, uids, threshold, expected_mask):
+        batch = self._make_batch(scores, uids)
+        mask = compute_zero_adv_kl_mask(batch, threshold=threshold)
+        if expected_mask is None:
+            self.assertIsNone(mask)
+        else:
+            self.assertIsNotNone(mask)
+            self.assertEqual(mask.tolist(), list(expected_mask))
+
+    def test_no_uid_returns_none(self):
+        batch = MagicMock()
+        batch.non_tensor_batch = {}
+        mask = compute_zero_adv_kl_mask(batch, threshold=0.0)
+        self.assertIsNone(mask)
+
+
+class TestBuildKlLossConfigs(unittest.TestCase):
+    """Tests for build_kl_loss_configs."""
+
+    @parameterized.expand(
+        (
+            ("neither", "kl", 0.0, "low_var_kl", 0.0, None, []),
+            ("regular_only_no_mask", "kl", 0.1, "low_var_kl", 0.0, None, ["actor/kl_loss"]),
+            ("regular_only_za_mask", "kl", 0.1, "low_var_kl", 0.0, [True, False, False, True], ["actor/kl_loss"]),
+            ("za_only", "kl", 0.0, "low_var_kl", -0.1, [True, False, False, True], ["actor/kl_loss_zero_adv"]),
+            (
+                "both",
+                "kl",
+                0.1,
+                "low_var_kl",
+                -0.1,
+                [True, False, False, True],
+                ["actor/kl_loss", "actor/kl_loss_zero_adv"],
+            ),
+            ("za_mask_all_false", "kl", 0.1, "low_var_kl", -0.1, [False, False, False, False], ["actor/kl_loss"]),
+            ("za_mask_none_nonzero_coeff", "kl", 0.0, "low_var_kl", -0.1, None, []),
+        )
+    )
+    def test_build_kl_loss_configs(self, _name, kl_type, kl_coeff, type_za, coeff_za, mask, expected_keys):
+        za_kl_mask = torch.tensor(mask, dtype=torch.bool) if mask is not None else None
+        configs = build_kl_loss_configs(
+            kl_loss_type=kl_type,
+            kl_loss_coeff=kl_coeff,
+            kl_loss_type_za=type_za,
+            kl_loss_coeff_za=coeff_za,
+            za_kl_mask=za_kl_mask,
+        )
+        self.assertEqual([c.metric_key for c in configs], expected_keys)
+
+    def test_regular_kl_excludes_za_samples(self):
+        """Regular KL idx should exclude True positions in za_kl_mask."""
+        za_kl_mask = torch.tensor([True, False, False, True], dtype=torch.bool)
+        configs = build_kl_loss_configs(
+            kl_loss_type="kl",
+            kl_loss_coeff=0.1,
+            kl_loss_type_za="low_var_kl",
+            kl_loss_coeff_za=-0.1,
+            za_kl_mask=za_kl_mask,
+        )
+        regular = configs[0]
+        self.assertEqual(regular.metric_key, "actor/kl_loss")
+        self.assertEqual(regular.idx.tolist(), [1, 2])
+        self.assertEqual(regular.ref_key_for_log_prob, "ref_log_prob")
+        self.assertEqual(regular.kl_coeff, 0.1)
+
+        za = configs[1]
+        self.assertEqual(za.metric_key, "actor/kl_loss_zero_adv")
+        self.assertEqual(za.idx.tolist(), [0, 3])
+        self.assertEqual(za.ref_key_for_log_prob, "old_log_probs")
+        self.assertEqual(za.kl_coeff, -0.1)
+
+    def test_regular_kl_no_mask_idx_is_none(self):
+        """Without za_kl_mask, regular KL idx should be None (all samples)."""
+        configs = build_kl_loss_configs(
+            kl_loss_type="kl",
+            kl_loss_coeff=0.1,
+            kl_loss_type_za="low_var_kl",
+            kl_loss_coeff_za=0.0,
+            za_kl_mask=None,
+        )
+        self.assertEqual(len(configs), 1)
+        self.assertIsNone(configs[0].idx)
 
 
 if __name__ == "__main__":

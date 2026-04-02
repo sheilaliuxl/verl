@@ -56,6 +56,9 @@ class FilterGroupsConfig(BaseConfig):
     max_num_gen_batches: int = 0
 
 
+DEFAULT_ZERO_ADV_KL_LOSS_TYPE = "low_var_kl"
+
+
 @dataclass
 class FilterZeroAdvConfig(BaseConfig):
     """Configuration for filter_zero_adv (skip zero-advantage responses in actor update).
@@ -66,10 +69,26 @@ class FilterZeroAdvConfig(BaseConfig):
         match_loss_curve (bool): Whether to add ghost optimizer.step() calls to preserve
             the same number of optimizer updates as unfiltered training, matching the
             baseline convergence curve.
+        all_negative_prompt_score_threshold_le (float): Score threshold for classifying a zero-adv group
+            as "all-wrong". A group is all-wrong if max(group_scores) <= threshold.
+            Default 0.0 works for binary {0,1} and {-1,1} reward schemes.
+        all_negative_prompt_kl_coeff (float): KL coefficient for all-wrong zero-adv groups.
+            When != 0, all-wrong zero-adv samples are kept (not filtered) and receive
+            KL loss: ``all_negative_prompt_kl_coeff * KL(pi_theta || pi_old)``.
+            Expected to be non-positive (repulsive: push away from failing strategy).
+            Positive values are for ablation only (anchoring direction).
+            Uses old_log_probs (rollout policy) as reference — no extra ref model
+            forward pass needed. 0 = disabled (all zero-adv samples filtered as usual).
+        kl_loss_type (str): KL penalty type for all-negative-prompt KL. Must be symmetric
+            (always >= 0): "low_var_kl", "mse", or "abs". Do NOT use "kl"/"k1"
+            (directional, not appropriate for repulsive KL).
     """
 
     enable: bool = False
     match_loss_curve: bool = True
+    all_negative_prompt_score_threshold_le: float = 0.0
+    all_negative_prompt_kl_coeff: float = 0.0
+    kl_loss_type: str = DEFAULT_ZERO_ADV_KL_LOSS_TYPE
 
 
 @dataclass
