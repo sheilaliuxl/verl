@@ -70,8 +70,8 @@ def build_kl_loss_configs(
 ) -> list[KLConfig]:
     """Build KL loss configs for the actor update loop.
 
-    Splits samples so that regular KL excludes all-wrong zero-adv samples
-    (avoids accidentally anchoring them with positive beta).
+    Regular KL applies to ALL samples (including all-wrong zero-adv) to provide
+    anchoring toward pi_ref. Repulsive KL applies only to all-wrong samples.
 
     Args:
         kl_loss_type: KL penalty type for regular KL.
@@ -87,8 +87,7 @@ def build_kl_loss_configs(
     configs: list[KLConfig] = []
 
     if kl_loss_coeff != 0:
-        non_za_idx = (~za_kl_mask).nonzero(as_tuple=True)[0] if za_active else None
-        configs.append(KLConfig(non_za_idx, "ref_log_prob", kl_loss_type, kl_loss_coeff, "actor/kl_loss"))
+        configs.append(KLConfig(None, "ref_log_prob", kl_loss_type, kl_loss_coeff, "actor/kl_loss"))
 
     if kl_loss_coeff_za != 0 and za_active:
         za_idx = za_kl_mask.nonzero(as_tuple=True)[0]

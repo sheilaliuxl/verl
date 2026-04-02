@@ -767,8 +767,8 @@ class TestBuildKlLossConfigs(unittest.TestCase):
         )
         self.assertEqual([c.metric_key for c in configs], expected_keys)
 
-    def test_regular_kl_excludes_za_samples(self):
-        """Regular KL idx should exclude True positions in za_kl_mask."""
+    def test_regular_kl_includes_all_samples(self):
+        """Regular KL idx should be None (all samples) even when za_kl_mask is active."""
         za_kl_mask = torch.tensor([True, False, False, True], dtype=torch.bool)
         configs = build_kl_loss_configs(
             kl_loss_type="kl",
@@ -779,7 +779,7 @@ class TestBuildKlLossConfigs(unittest.TestCase):
         )
         regular = configs[0]
         self.assertEqual(regular.metric_key, "actor/kl_loss")
-        self.assertEqual(regular.idx.tolist(), [1, 2])
+        self.assertIsNone(regular.idx)
         self.assertEqual(regular.ref_key_for_log_prob, "ref_log_prob")
         self.assertEqual(regular.kl_coeff, 0.1)
 

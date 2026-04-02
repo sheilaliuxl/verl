@@ -761,6 +761,13 @@ class DataParallelPPOActor(BasePPOActor):
                             rm = rm[idx]
                         kld = kl_penalty(logprob=lp, ref_logprob=ref_lp, kl_penalty=kl_type)
                         kl_loss_val = agg_loss(loss_mat=kld, loss_mask=rm, loss_agg_mode=loss_agg_mode)
+                        if metric_key == "actor/kl_loss_zero_adv":
+                            if loss_agg_mode == LOSS_AGG_TOKEN_MEAN:
+                                ratio = rm.sum() / response_mask.sum()
+                            else:
+                                ratio = len(idx) / log_prob.shape[0]
+                            cap = 1e-3 * (max(ratio, 0.1) * 10) ** 0.5
+                            kl_loss_val *= ratio**2 * (cap / kl_loss_val.detach()).clamp(max=1.0)
                         policy_loss += kl_loss_val * kl_coeff
                         metrics[metric_key] = (
                             metrics.get(metric_key, 0.0) + kl_loss_val.detach().item() * loss_scale_factor

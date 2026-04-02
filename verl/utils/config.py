@@ -175,9 +175,9 @@ def validate_config(
     if _filter_zero_adv.enable and (
         config.actor_rollout_ref.actor.use_kl_loss and config.actor_rollout_ref.actor.kl_loss_coef != 0
     ):
-        raise ValueError(
-            "algorithm.filter_zero_adv and actor KL loss (use_kl_loss=True, kl_loss_coef != 0)"
-            " cannot both be enabled — zero-adv samples still contribute to KL loss."
+        print(
+            "WARNING: algorithm.filter_zero_adv and actor KL loss (use_kl_loss=True, kl_loss_coef != 0)"
+            " are both enabled — regular KL will exclude all-wrong zero-adv samples."
         )
     if _filter_zero_adv.enable and config.actor_rollout_ref.actor.entropy_coeff != 0:
         raise ValueError(
