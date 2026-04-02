@@ -27,12 +27,15 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
+from verl.trainer.config.algorithm import DEFAULT_ZERO_ADV_KL_LOSS_TYPE
 from verl.trainer.ppo.core_algos import LOSS_AGG_TOKEN_MEAN, agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.metric_utils import (
     KEY_FILTER_ZERO_ADV_CONFIG,
     KEY_NUM_SEQS_CORRECTION_FACTOR,
     KEY_NUM_TOKENS_CORRECTION_FACTOR,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
+    KEY_ZERO_ADV_KL_MASK,
+    build_kl_loss_configs,
     ceildiv,
 )
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
@@ -581,6 +584,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if KEY_ZERO_ADV_KL_MASK in data.batch.keys():
+            select_keys.append(KEY_ZERO_ADV_KL_MASK)
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -730,17 +735,42 @@ class DataParallelPPOActor(BasePPOActor):
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
 
-                    if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    _fza_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
+                    _fza_enabled = getattr(_fza_config, "enable", False) if _fza_config else False
+                    kl_configs = build_kl_loss_configs(
+                        kl_loss_type=self.config.kl_loss_type,
+                        kl_loss_coeff=self.config.use_kl_loss * self.config.kl_loss_coef,
+                        kl_loss_type_za=(
+                            getattr(_fza_config, "kl_loss_type", DEFAULT_ZERO_ADV_KL_LOSS_TYPE)
+                            if _fza_enabled
+                            else DEFAULT_ZERO_ADV_KL_LOSS_TYPE
+                        ),
+                        kl_loss_coeff_za=(
+                            getattr(_fza_config, "all_negative_prompt_kl_coeff", 0.0) if _fza_enabled else 0.0
+                        ),
+                        za_kl_mask=model_inputs.get(KEY_ZERO_ADV_KL_MASK, None),
+                    )
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                    for idx, ref_key_for_log_prob, kl_type, kl_coeff, metric_key in kl_configs:
+                        lp = log_prob
+                        ref_lp = model_inputs[ref_key_for_log_prob]
+                        rm = response_mask
+                        if idx is not None:
+                            lp = lp[idx]
+                            ref_lp = ref_lp[idx]
+                            rm = rm[idx]
+                        kld = kl_penalty(logprob=lp, ref_logprob=ref_lp, kl_penalty=kl_type)
+                        kl_loss_val = agg_loss(loss_mat=kld, loss_mask=rm, loss_agg_mode=loss_agg_mode)
+                        policy_loss += kl_loss_val * kl_coeff
+                        metrics[metric_key] = (
+                            metrics.get(metric_key, 0.0) + kl_loss_val.detach().item() * loss_scale_factor
+                        )
+                    if self.config.use_kl_loss:
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                    if _fza_enabled:
+                        kl_coeff_za = getattr(_fza_config, "all_negative_prompt_kl_coeff", 0.0)
+                        if kl_coeff_za != 0:
+                            micro_batch_metrics["actor/kl_coef_zero_adv"] = kl_coeff_za
 
                     loss = policy_loss * loss_scale_factor
 

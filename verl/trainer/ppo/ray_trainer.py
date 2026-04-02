@@ -45,10 +45,12 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     KEY_FILTER_ZERO_ADV_CONFIG,
+    KEY_ZERO_ADV_KL_MASK,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    compute_zero_adv_kl_mask,
     filter_zero_adv_batch,
     maybe_add_corrected_mfu,
     process_validation_metrics,
@@ -1562,6 +1564,16 @@ class RayPPOTrainer:
                     # Keep the unfiltered batch for critic update and metrics; use filtered batch for actor.
                     actor_batch = batch
                     if self.config.algorithm.filter_zero_adv.enable:
+                        # Compute all-wrong zero-adv mask for repulsive KL (before filtering).
+                        kl_coef_za = self.config.algorithm.filter_zero_adv.all_negative_prompt_kl_coeff
+                        if kl_coef_za != 0:
+                            za_mask = compute_zero_adv_kl_mask(
+                                batch,
+                                threshold=self.config.algorithm.filter_zero_adv.all_negative_prompt_score_threshold_le,
+                            )
+                            if za_mask is not None:
+                                batch.batch[KEY_ZERO_ADV_KL_MASK] = za_mask
+
                         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
                         actor_batch, filter_metrics = filter_zero_adv_batch(
                             batch,

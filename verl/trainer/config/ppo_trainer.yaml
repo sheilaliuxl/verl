@@ -112,6 +112,15 @@ algorithm:
     # Whether to add ghost optimizer.step() to match baseline convergence curve
     match_loss_curve: True
 
+    # Score threshold (<=) for classifying a response as "wrong" in all-wrong groups
+    all_negative_prompt_score_threshold_le: 0.0
+
+    # KL coeff for all-wrong zero-adv groups (non-positive = repulsive, positive = ablation only)
+    all_negative_prompt_kl_coeff: 0.0
+
+    # KL type for zero-adv repulsive KL (must be symmetric: low_var_kl, mse, abs)
+    kl_loss_type: low_var_kl
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

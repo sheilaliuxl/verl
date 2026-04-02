@@ -660,6 +660,9 @@ algorithm:
   filter_zero_adv:
     enable: false
     match_loss_curve: true
+    all_negative_prompt_score_threshold_le: 0.0
+    all_negative_prompt_kl_coeff: 0.0
+    kl_loss_type: low_var_kl
   use_pf_ppo: false
   pf_ppo:
     reweight_method: pow
