@@ -465,6 +465,121 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
+    def _maybe_dump_zero_adv_samples(self, batch: DataProto, epoch: int):
+        """Dump all-0 and all-1 zero-adv group info per step.
+
+        Controlled by env var ZERO_ADV_SAMPLE_DUMP_PATH. At each step, writes:
+        - All UIDs (sorted) for all-0 and all-1 groups, with prompts
+        - First 3 UIDs (sorted) with full responses and scores
+
+        Note: After _balance_batch, responses for the same UID may be scattered
+        (no longer consecutive). We group by UID to handle arbitrary ordering.
+        """
+        dump_path = os.environ.get("ZERO_ADV_SAMPLE_DUMP_PATH")
+        if not dump_path:
+            return
+
+        uids = batch.non_tensor_batch["uid"]  # one uid per response
+        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+
+        # Group response indices by UID (handles scattered order after _balance_batch)
+        from collections import defaultdict
+
+        uid_to_indices = defaultdict(list)
+        for i, uid in enumerate(uids):
+            uid_to_indices[uid].append(i)
+
+        # Classify: all-0 (all scores == 0) vs all-1 (all scores > 0)
+        all_0_uids = []  # (uid, [indices])
+        all_1_uids = []
+        for uid, indices in uid_to_indices.items():
+            group_scores = [scores[i] for i in indices]
+            if all(s == 0 for s in group_scores):
+                all_0_uids.append((uid, indices))
+            elif all(s > 0 for s in group_scores):
+                all_1_uids.append((uid, indices))
+
+        all_0_uids.sort(key=lambda x: x[0])
+        all_1_uids.sort(key=lambda x: x[0])
+
+        # Decode prompts for all UIDs, responses only for first 3
+        def _build_entries(uid_list, decode_limit=3):
+            entries = []
+            # Decode one prompt per UID (use first index in each group)
+            prompts_to_decode = [indices[0] for _, indices in uid_list]
+            prompt_texts = (
+                self.tokenizer.batch_decode(batch.batch["prompts"][prompts_to_decode], skip_special_tokens=True)
+                if prompts_to_decode
+                else []
+            )
+
+            for rank, ((uid, indices), prompt) in enumerate(zip(uid_list, prompt_texts, strict=False)):
+                group_scores = [scores[i] for i in indices]
+                entry = {"uid": uid, "prompt": prompt, "n": len(indices)}
+                if rank < decode_limit:
+                    resp_texts = self.tokenizer.batch_decode(
+                        batch.batch["responses"][indices], skip_special_tokens=True
+                    )
+                    entry["responses"] = resp_texts
+                    entry["scores"] = group_scores
+                entries.append(entry)
+            return entries
+
+        num_prompts = len(uid_to_indices)  # unique prompts in this step
+        num_samples = len(uids)  # total responses (num_prompts * n)
+        record = {
+            "epoch": epoch,
+            "step": self.global_steps,
+            "num_prompts": num_prompts,
+            "num_samples": num_samples,
+            "all_0": {
+                "count": len(all_0_uids),
+                "entries": _build_entries(all_0_uids),
+            },
+            "all_1": {
+                "count": len(all_1_uids),
+                "entries": _build_entries(all_1_uids),
+            },
+        }
+
+        os.makedirs(dump_path, exist_ok=True)
+
+        # Full dump (with responses and scores)
+        step_file = os.path.join(dump_path, f"step_samples_{self.global_steps:04d}.json")
+        with open(step_file, "w") as f:
+            json.dump(record, f, sort_keys=True, indent=2)
+
+        # Prompts-only dump (strip responses and scores)
+        import copy
+
+        prompts_record = copy.deepcopy(record)
+        for group_key in ("all_0", "all_1"):
+            for entry in prompts_record[group_key]["entries"]:
+                entry.pop("responses", None)
+                entry.pop("scores", None)
+        prompts_file = os.path.join(dump_path, f"step_samples_{self.global_steps:04d}.prompts.json")
+        with open(prompts_file, "w") as f:
+            json.dump(prompts_record, f, sort_keys=True, indent=2)
+
+        # Markdown dump (readable format, each prompt as a section)
+        md_lines = [
+            f"# Step {self.global_steps} (Epoch {epoch}, {num_prompts} prompts,"
+            f" {num_samples} samples) — Zero-Adv Samples\n"
+        ]
+        for group_key, label in [("all_0", "All-Wrong"), ("all_1", "All-Correct")]:
+            group = record[group_key]
+            md_lines.append(f"## {label} ({group['count']} prompts)\n")
+            for i, entry in enumerate(group["entries"]):
+                md_lines.append(f"### {label} #{i + 1} — {entry['uid']}\n")
+                md_lines.append(f"```\n{entry['prompt']}\n```\n")
+                if "responses" in entry:
+                    for j, (resp, score) in enumerate(zip(entry["responses"], entry["scores"], strict=False)):
+                        md_lines.append(f"#### Response {j + 1} (score={score})\n")
+                        md_lines.append(f"{resp}\n")
+        md_file = os.path.join(dump_path, f"step_samples_{self.global_steps:04d}.md")
+        with open(md_file, "w") as f:
+            f.write("\n".join(md_lines))
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -1556,6 +1671,9 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    # Dump zero-adv samples (all-0 and all-1 groups) if configured.
+                    self._maybe_dump_zero_adv_samples(batch, epoch=epoch)
 
                     # Filter zero-advantage responses to skip wasted actor compute.
                     # Responses in all-same-reward groups have advantage≈0 and contribute no policy gradient.
