@@ -73,6 +73,30 @@ class FilterZeroAdvConfig(BaseConfig):
 
 
 @dataclass
+class HistoricalInjectionConfig(BaseConfig):
+    """Configuration for historical injection (break all-0 zero-advantage symmetry).
+
+    When enabled, tracks per-prompt statistics across epochs and injects a stored
+    correct response into all-0 groups, creating mixed-reward groups with non-zero
+    advantage and gradient signal. No extra generation cost.
+
+    Args:
+        enable (bool): Whether to enable historical injection. Requires multiple
+            epochs to be effective (no injection in epoch 0).
+        max_num_injected_responses (int): Maximum number of responses to replace with
+            historical correct responses per all-0 group. Must be < n (rollout_n).
+            Default 1 — replace one wrong response per group.
+        negative_score_threshold_le (float): Scores <= this value are considered
+            negative/wrong responses. Default 0, works for both {-1, 1} and
+            {0, 1} reward schemes.
+    """
+
+    enable: bool = False
+    max_num_injected_responses: int = 1
+    negative_score_threshold_le: float = 0.0
+
+
+@dataclass
 class RolloutCorrectionConfig(BaseConfig):
     """Configuration for Rollout Correction (addresses off-policy issues in RL training).
 
@@ -648,6 +672,8 @@ class AlgoConfig(BaseConfig):
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
         filter_zero_adv (FilterZeroAdvConfig): Configuration for skipping zero-advantage responses
             in actor update. See FilterZeroAdvConfig for details.
+        historical_injection (HistoricalInjectionConfig): Configuration for injecting stored correct
+            responses into all-0 zero-advantage groups. See HistoricalInjectionConfig for details.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -677,6 +703,7 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     filter_zero_adv: FilterZeroAdvConfig = field(default_factory=FilterZeroAdvConfig)
+    historical_injection: HistoricalInjectionConfig = field(default_factory=HistoricalInjectionConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

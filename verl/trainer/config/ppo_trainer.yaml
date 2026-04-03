@@ -112,6 +112,13 @@ algorithm:
     # Whether to add ghost optimizer.step() to match baseline convergence curve
     match_loss_curve: True
 
+  # Inject stored correct responses into all-0 zero-advantage groups to break
+  # symmetry and provide gradient signal. Requires multiple epochs.
+  historical_injection:
+    enable: False
+    max_num_injected_responses: 1
+    negative_score_threshold_le: 0.0
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

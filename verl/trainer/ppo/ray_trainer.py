@@ -53,6 +53,12 @@ from verl.trainer.ppo.metric_utils import (
     maybe_add_corrected_mfu,
     process_validation_metrics,
 )
+from verl.trainer.ppo.prompt_history import (
+    STAT_INJECT_COUNT,
+    STAT_MISS_COUNT,
+    inject_historical_responses,
+    update_prompt_history,
+)
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
     Role,
@@ -282,6 +288,10 @@ class RayPPOTrainer:
         self.processor = processor
         self.config = config
 
+        # Per-prompt history for historical injection.
+        # Key: prompt ID (KEY_PROMPT_ID field), value: dict with streak counts and stored response.
+        self.prompt_history: dict = {}
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -464,6 +474,37 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _maybe_inject_historical_responses(self, batch: DataProto, epoch: int, metrics: dict):
+        """Inject stored correct responses into all-0 groups. See prompt_history.py."""
+        if not self.config.algorithm.historical_injection.enable or epoch == 0:
+            return
+
+        hi_config = self.config.algorithm.historical_injection
+        stats = inject_historical_responses(
+            batch,
+            self.prompt_history,
+            epoch,
+            max_num_injected=hi_config.max_num_injected_responses,
+            negative_score_threshold_le=hi_config.negative_score_threshold_le,
+        )
+        if stats[STAT_INJECT_COUNT] > 0 or stats[STAT_MISS_COUNT] > 0:
+            metrics.update({f"zero_adv/inject_{k}": v for k, v in stats.items()})
+
+    def _maybe_update_prompt_history(self, batch: DataProto, epoch: int, metrics: dict):
+        """Update per-prompt history after each step. See prompt_history.py."""
+        if not self.config.algorithm.historical_injection.enable:
+            return
+
+        hi_config = self.config.algorithm.historical_injection
+        stats = update_prompt_history(
+            batch,
+            self.prompt_history,
+            epoch,
+            negative_score_threshold_le=hi_config.negative_score_threshold_le,
+            max_num_stored=hi_config.max_num_injected_responses,
+        )
+        metrics.update({f"zero_adv/history_{k}": v for k, v in stats.items()})
 
     def _maybe_dump_zero_adv_samples(self, batch: DataProto, epoch: int):
         """Dump all-0 and all-1 zero-adv group info per step.
@@ -1561,6 +1602,11 @@ class RayPPOTrainer:
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
+                        # Inject historical correct responses into all-0 groups (if enabled).
+                        # Must be after rm_scores and before extract_reward so that
+                        # extract_reward produces correct reward_tensor.
+                        self._maybe_inject_historical_responses(batch, epoch=epoch, metrics=metrics)
+
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
@@ -1674,6 +1720,9 @@ class RayPPOTrainer:
 
                     # Dump zero-adv samples (all-0 and all-1 groups) if configured.
                     self._maybe_dump_zero_adv_samples(batch, epoch=epoch)
+
+                    # Update per-prompt history (for historical injection).
+                    self._maybe_update_prompt_history(batch, epoch=epoch, metrics=metrics)
 
                     # Filter zero-advantage responses to skip wasted actor compute.
                     # Responses in all-same-reward groups have advantage≈0 and contribute no policy gradient.

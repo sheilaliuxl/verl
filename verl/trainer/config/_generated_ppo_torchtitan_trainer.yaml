@@ -628,6 +628,10 @@ algorithm:
   filter_zero_adv:
     enable: false
     match_loss_curve: true
+  historical_injection:
+    enable: false
+    max_num_injected_responses: 1
+    negative_score_threshold_le: 0.0
   use_pf_ppo: false
   pf_ppo:
     reweight_method: pow
