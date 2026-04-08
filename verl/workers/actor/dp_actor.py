@@ -29,10 +29,14 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import LOSS_AGG_TOKEN_MEAN, agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.metric_utils import (
+    KEY_ADVANTAGES,
+    KEY_ATTENTION_MASK,
     KEY_FILTER_ZERO_ADV_CONFIG,
     KEY_NUM_SEQS_CORRECTION_FACTOR,
     KEY_NUM_TOKENS_CORRECTION_FACTOR,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
+    KEY_RESPONSE_MASK,
+    ZERO_ADV_EPS,
     ceildiv,
 )
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
@@ -51,6 +55,48 @@ from verl.workers.config import ActorConfig
 __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def filter_zero_adv_micro_batch(
+    micro_batch: DataProto,
+) -> tuple[DataProto, int, int, float]:
+    """Filter zero-adv samples from a single micro-batch.
+
+    Applied per-micro-batch after the baseline mini-batch → micro-batch split, so all
+    DP ranks have the same number of micro-batches (same number of backward calls).
+    This eliminates the FSDP deadlock risk of mini-batch-level filtering.
+
+    All-zero micro-batches keep their shortest sample (by attention_mask) so the
+    backward pass participates in FSDP collectives with ~0 gradient.
+
+    Returns:
+        (filtered_micro_batch, num_nonzero, original_size, original_tokens)
+    """
+    response_mask = micro_batch.batch[KEY_RESPONSE_MASK]
+    original_tokens = response_mask.sum().item()
+    max_abs_adv = (micro_batch.batch[KEY_ADVANTAGES].abs() * response_mask).max(dim=-1).values
+    nonzero_mask = max_abs_adv >= ZERO_ADV_EPS
+    nonzero_indices = torch.where(nonzero_mask)[0]
+
+    original_size = len(micro_batch)
+    num_nonzero = len(nonzero_indices)
+
+    if num_nonzero == original_size:
+        # All nonzero: no filtering needed.
+        return micro_batch, num_nonzero, original_size, original_tokens
+
+    if num_nonzero == 0:
+        # All zero-adv: keep 1 shortest sample for FSDP collective participation.
+        seq_lens = micro_batch.batch[KEY_ATTENTION_MASK].sum(dim=-1)
+        keep_indices = [seq_lens.argmin().item()]
+    else:
+        # Mixed: keep only nonzero-adv samples.
+        keep_indices = nonzero_indices.tolist()
+
+    filtered = micro_batch[keep_indices]
+    filtered.meta_info = dict(micro_batch.meta_info)  # own copy (splits share by ref)
+    return filtered, num_nonzero, original_size, original_tokens
 
 
 @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -65,11 +111,27 @@ def _split_filter_zero_adv_mini_batches(
     """
     filter_zero_adv_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
     _filter_zero_adv = filter_zero_adv_config is not None and getattr(filter_zero_adv_config, "enable", False)
+    _match_loss_curve = _filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
+    _match_mini_batch_data_split = _match_loss_curve and getattr(
+        filter_zero_adv_config, "match_mini_batch_data_split", False
+    )
+
+    if _match_mini_batch_data_split:
+        # Split-then-filter: data is the FULL (unfiltered) batch from trainer.
+        # Split into K mini-batches using ppo_mini_batch_size (identical to baseline).
+        # Filtering happens later at micro-batch level (in the training loop) to ensure
+        # all DP ranks have the same number of backward calls, preventing FSDP deadlock.
+        mini_batches = data.split(ppo_mini_batch_size)
+        metrics = {
+            "actor/num_mini_batches": len(mini_batches),
+            "actor/num_ghost_mini_batches": 0,
+        }
+        return mini_batches, True, True, 0, metrics
 
     # When filtering is a no-op (nothing removed), KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP
     # is not set — treat as if filter_zero_adv is off.
     filter_zero_adv = _filter_zero_adv and KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP in data.meta_info
-    match_loss_curve = filter_zero_adv and getattr(filter_zero_adv_config, "match_loss_curve", False)
+    match_loss_curve = filter_zero_adv and _match_loss_curve
 
     # Original per-DP-group batch size (before filter_zero_adv), for K computation.
     original_bs = data.meta_info.get(KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP, len(data))
@@ -93,9 +155,6 @@ def _split_filter_zero_adv_mini_batches(
         metrics["actor/num_ghost_mini_batches"] = num_ghost_opt_steps
 
     return mini_batches, filter_zero_adv, match_loss_curve, num_ghost_opt_steps, metrics
-
-
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
@@ -604,6 +663,12 @@ class DataParallelPPOActor(BasePPOActor):
             data, self.config.ppo_mini_batch_size
         )
 
+        # Detect split-then-filter mode: filtering happens per-micro-batch in the loop below.
+        _fza_config = data.meta_info.get(KEY_FILTER_ZERO_ADV_CONFIG, None)
+        _filter_micro_batches = (
+            match_loss_curve and _fza_config is not None and getattr(_fza_config, "match_mini_batch_data_split", False)
+        )
+
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {
@@ -611,6 +676,9 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0,
             **split_metrics,
         }
+        fza_total_nonzero = 0
+        fza_total_kept = 0
+        fza_total_count = 0
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -631,6 +699,22 @@ class DataParallelPPOActor(BasePPOActor):
                         # mini-batch in the fewer-K path without extra correction.
                         self.gradient_accumulation = len(micro_batches)
 
+                # Per-micro-batch zero-adv filtering: same number of micro-batches
+                # on all DP ranks (no FSDP deadlock), each micro-batch just gets smaller.
+                original_micro_sizes = []
+                original_micro_tokens = []
+                if _filter_micro_batches:
+                    filtered = []
+                    for mb in micro_batches:
+                        f_mb, n_nz, orig_sz, orig_tok = filter_zero_adv_micro_batch(mb)
+                        filtered.append(f_mb)
+                        original_micro_sizes.append(orig_sz)
+                        original_micro_tokens.append(orig_tok)
+                        fza_total_nonzero += n_nz
+                        fza_total_kept += len(f_mb)
+                        fza_total_count += orig_sz
+                    micro_batches = filtered
+
                 self.actor_optimizer.zero_grad()
 
                 for micro_batch_idx, micro_batch in enumerate(micro_batches):
@@ -649,6 +733,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weight each micro-batch so every sequence contributes
                     # 1/mini_bs to the gradient regardless of micro-batch size.
                     if self.config.use_dynamic_bsz:
+                        # #seqs is post-filter when filtering is active, which auto-corrects for removed za samples.
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -657,18 +742,34 @@ class DataParallelPPOActor(BasePPOActor):
                         # fewer-K: GA = len(micro_batches) naturally handles partial
                         # last mini-batch without extra correction.
 
-                    # Token-density correction for filter_zero_adv with token_mean:
-                    # loss_scale_factor already corrects for sample count, but token_mean
-                    # normalizes by total tokens. Removing zero-adv samples (often long
-                    # all-wrong responses) changes the avg tokens/seq, inflating the
-                    # per-sample gradient. Correct by the token-density ratio
-                    # (tokens_correction / seqs_correction) so the effective denominator
-                    # matches the original batch's token density.
-                    if match_loss_curve and loss_agg_mode == LOSS_AGG_TOKEN_MEAN:
-                        token_corr = data.meta_info.get(KEY_NUM_TOKENS_CORRECTION_FACTOR, 1.0)
-                        seq_corr = data.meta_info.get(KEY_NUM_SEQS_CORRECTION_FACTOR, 1.0)
-                        if seq_corr > 0:
-                            loss_scale_factor *= token_corr / seq_corr
+                    # Per-GA-step correction for zero-adv filtering.
+                    ga_loss_scale_factor = 1.0
+                    if _filter_micro_batches:
+                        if original_micro_sizes:
+                            orig_sz = original_micro_sizes[micro_batch_idx]
+                            filtered_sz = response_mask.shape[0]
+                            if filtered_sz < orig_sz:
+                                seq_corr = filtered_sz / orig_sz
+                                # use_dynamic_bsz: loss_scale_factor already reflects
+                                # filtered_sz, so seq correction is automatic.
+                                if not self.config.use_dynamic_bsz:
+                                    ga_loss_scale_factor *= seq_corr
+                                # Token-mean: additionally correct for token density.
+                                if loss_agg_mode == LOSS_AGG_TOKEN_MEAN:
+                                    orig_tok = original_micro_tokens[micro_batch_idx]
+                                    filtered_tok = response_mask.sum().item()
+                                    token_corr = filtered_tok / orig_tok if orig_tok > 0 else 1.0
+                                    ga_loss_scale_factor *= token_corr / seq_corr
+                    elif match_loss_curve:
+                        # Filter-then-split: for seq-mean modes, 2× nz content per micro-batch
+                        # × 0.5× fewer micro-batches cancel — no correction needed.
+                        # Token-mean needs correction for changed token denominator.
+                        if loss_agg_mode == LOSS_AGG_TOKEN_MEAN:
+                            seq_corr = mini_batch.meta_info.get(KEY_NUM_SEQS_CORRECTION_FACTOR, 1.0)
+                            if seq_corr > 0:
+                                token_corr = mini_batch.meta_info.get(KEY_NUM_TOKENS_CORRECTION_FACTOR, 1.0)
+                                ga_loss_scale_factor *= token_corr / seq_corr
+                    loss_scale_factor *= ga_loss_scale_factor
 
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
@@ -766,4 +867,15 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         self.actor_optimizer.zero_grad()
+
+        if _filter_micro_batches and fza_total_count > 0:
+            metrics.update(
+                {
+                    "actor/filter_zero_adv/num_nonzero": fza_total_nonzero,
+                    "actor/filter_zero_adv/num_kept": fza_total_kept,
+                    "actor/filter_zero_adv/num_total": fza_total_count,
+                    "actor/filter_zero_adv/kept_ratio": fza_total_kept / fza_total_count,
+                }
+            )
+
         return metrics

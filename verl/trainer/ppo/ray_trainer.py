@@ -1561,14 +1561,20 @@ class RayPPOTrainer:
                     # Keep the unfiltered batch for critic update and metrics; use filtered batch for actor.
                     actor_batch = batch
                     if self.config.algorithm.filter_zero_adv.enable:
-                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                        actor_batch, filter_metrics = filter_zero_adv_batch(
-                            batch,
-                            dp_size,
-                            ppo_mini_batch_size=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
-                        )
-                        actor_batch.meta_info[KEY_FILTER_ZERO_ADV_CONFIG] = self.config.algorithm.filter_zero_adv
-                        metrics.update(filter_metrics)
+                        fza_config = self.config.algorithm.filter_zero_adv
+                        if fza_config.match_loss_curve and fza_config.match_mini_batch_data_split:
+                            # Split-then-filter: send full batch to actor, filter within each mini-batch.
+                            # This preserves baseline's mini-batch data assignment for exact convergence match.
+                            pass
+                        else:
+                            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                            actor_batch, filter_metrics = filter_zero_adv_batch(
+                                batch,
+                                dp_size,
+                                ppo_mini_batch_size=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
+                            )
+                            metrics.update(filter_metrics)
+                        actor_batch.meta_info[KEY_FILTER_ZERO_ADV_CONFIG] = fza_config
 
                     # update critic
                     if self.use_critic:

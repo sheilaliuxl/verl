@@ -605,6 +605,7 @@ algorithm:
   filter_zero_adv:
     enable: false
     match_loss_curve: true
+    match_mini_batch_data_split: true
   use_pf_ppo: false
   pf_ppo:
     reweight_method: pow

@@ -112,6 +112,10 @@ algorithm:
     # Whether to add ghost optimizer.step() to match baseline convergence curve
     match_loss_curve: True
 
+    # Whether to preserve baseline's mini-batch data assignment (split-then-filter).
+    # Only effective when match_loss_curve is True. No-op when match_loss_curve is False.
+    match_mini_batch_data_split: True
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

@@ -66,10 +66,16 @@ class FilterZeroAdvConfig(BaseConfig):
         match_loss_curve (bool): Whether to add ghost optimizer.step() calls to preserve
             the same number of optimizer updates as unfiltered training, matching the
             baseline convergence curve.
+        match_mini_batch_data_split (bool): When True (and match_loss_curve=True), preserve
+            the baseline's mini-batch data assignment: split ALL data into K mini-batches
+            first (identical to baseline), then filter zero-adv within each mini-batch.
+            This is mathematically lossless (zero-adv = zero gradient) and ensures exact
+            convergence matching. No-op when match_loss_curve=False.
     """
 
     enable: bool = False
     match_loss_curve: bool = True
+    match_mini_batch_data_split: bool = True
 
 
 @dataclass
