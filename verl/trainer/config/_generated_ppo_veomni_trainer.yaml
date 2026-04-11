@@ -606,6 +606,12 @@ algorithm:
     enable: false
     match_loss_curve: true
     match_mini_batch_data_split: true
+  adaptive_gen_batch:
+    enable: false
+    max_num_gen_batches: 3
+    window_size: 5
+    warm_up_steps: 0
+    zero_adv_stats: median
   use_pf_ppo: false
   pf_ppo:
     reweight_method: pow

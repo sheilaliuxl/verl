@@ -17,7 +17,14 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "FilterZeroAdvConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AdaptiveGenBatchConfig",
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "FilterZeroAdvConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -76,6 +83,36 @@ class FilterZeroAdvConfig(BaseConfig):
     enable: bool = False
     match_loss_curve: bool = True
     match_mini_batch_data_split: bool = True
+
+
+@dataclass
+class AdaptiveGenBatchConfig(BaseConfig):
+    """Adaptive generation batch multiplier to compensate for zero-advantage filtering.
+
+    When filter_zero_adv removes a large fraction of samples, the effective training
+    batch shrinks. This feature pulls extra batches of fresh prompts from the dataset
+    (advancing through the epoch faster) so that after filtering, the useful batch
+    size stays close to the original.
+
+    Multiplier = min(floor(1 / (1 - p)), max_num_gen_batches), where p is the aggregated
+    zero-adv ratio over the last `window_size` steps (controlled by `zero_adv_stats`).
+    Only active after warmup.  Never crosses epoch boundaries.
+
+    Args:
+        enable (bool): Whether to enable adaptive gen batch multiplier.
+        max_num_gen_batches (int): Cap on batch multiplier (e.g. 3 means at most 3× prompts per step).
+        window_size (int): Number of recent steps for aggregating zero-adv ratio.
+        warm_up_steps (int): Number of steps before the multiplier activates.
+            Early steps can have high zero-adv ratio from formatting issues, not genuine
+            training signal.  0 means auto (2 × window_size).
+        zero_adv_stats (str): How to aggregate the zero-adv ratio window: "mean", "median", or "min".
+    """
+
+    enable: bool = False
+    max_num_gen_batches: int = 3
+    window_size: int = 5
+    warm_up_steps: int = 0
+    zero_adv_stats: str = "median"
 
 
 @dataclass
@@ -683,6 +720,7 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     filter_zero_adv: FilterZeroAdvConfig = field(default_factory=FilterZeroAdvConfig)
+    adaptive_gen_batch: AdaptiveGenBatchConfig = field(default_factory=AdaptiveGenBatchConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

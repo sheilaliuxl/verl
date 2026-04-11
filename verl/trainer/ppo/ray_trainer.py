@@ -21,7 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from pprint import pprint
 from typing import Any, Optional
@@ -45,13 +45,17 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     KEY_FILTER_ZERO_ADV_CONFIG,
+    METRIC_NAME_ZERO_ADV_RATIO,
+    aggregate_zero_adv_window,
     compute_data_metrics,
+    compute_gen_batch_multiplier,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
     filter_zero_adv_batch,
     maybe_add_corrected_mfu,
     process_validation_metrics,
+    pull_and_merge_gen_batches,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -1458,8 +1462,19 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # Adaptive gen batch: track zero-adv ratio window for batch multiplier.
+        agb_config = self.config.algorithm.get("adaptive_gen_batch", None)
+        agb_enabled = agb_config is not None and agb_config.get("enable", False)
+        _agb_warm_up_steps = (agb_config.warm_up_steps or 2 * agb_config.window_size) if agb_enabled else 0
+        agb_cumulative_data_batches = 0
+        # Initialize with zeros so multiplier=1 during warmup (min(window)=0 → no extra batches).
+        # Window is continuous across epochs — zero-adv ratio doesn't reset at epoch boundaries.
+        _agb_ws = agb_config.window_size if agb_enabled else 1
+        agb_window: deque[float] = deque([0.0] * _agb_ws, maxlen=_agb_ws)
+
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            dl_iter = iter(self.train_dataloader)
+            for batch_dict in dl_iter:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1472,6 +1487,29 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                # Adaptive gen batch: pull extra batches from the same epoch to compensate
+                # for zero-adv filtering.  Never crosses epoch boundaries.
+                if agb_enabled:
+                    if self.global_steps >= _agb_warm_up_steps:
+                        multiplier = compute_gen_batch_multiplier(
+                            agb_window, agb_config.max_num_gen_batches, agb_config.zero_adv_stats
+                        )
+                    else:
+                        multiplier = 1
+                    batch, num_extra_batches = pull_and_merge_gen_batches(batch, dl_iter, multiplier - 1)
+                    agb_cumulative_data_batches += 1 + num_extra_batches
+                    metrics.update(
+                        {
+                            "adaptive_gen_batch/num_raw_batches": 1 + num_extra_batches,
+                            "adaptive_gen_batch/num_prompts": len(batch),
+                            "adaptive_gen_batch/cumulative_data_batches": agb_cumulative_data_batches,
+                            "adaptive_gen_batch/p_zero_adv_window": aggregate_zero_adv_window(
+                                agb_window, agb_config.zero_adv_stats
+                            ),
+                        }
+                    )
+
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
@@ -1779,6 +1817,14 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Update adaptive gen batch window with this step's zero-adv ratio.
+                if agb_enabled:
+                    if METRIC_NAME_ZERO_ADV_RATIO not in metrics and not getattr(self, "_agb_zar_warned", False):
+                        logger.warning(
+                            "adaptive_gen_batch: metric %s not found, defaulting to 0.0", METRIC_NAME_ZERO_ADV_RATIO
+                        )
+                        self._agb_zar_warned = True
+                    agb_window.append(metrics.get(METRIC_NAME_ZERO_ADV_RATIO, 0.0))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):

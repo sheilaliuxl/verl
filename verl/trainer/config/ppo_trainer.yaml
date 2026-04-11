@@ -116,6 +116,27 @@ algorithm:
     # Only effective when match_loss_curve is True. No-op when match_loss_curve is False.
     match_mini_batch_data_split: True
 
+  # Adaptive generation batch multiplier.
+  # Pulls extra batches of fresh prompts per step to compensate for zero-adv filtering,
+  # so that the useful (non-zero-adv) batch size stays close to the original.
+  adaptive_gen_batch:
+
+    # Whether to enable adaptive gen batch multiplier.
+    enable: False
+
+    # Cap on batch multiplier (e.g. 3 means at most 3x prompts per step).
+    max_num_gen_batches: 3
+
+    # Number of recent steps for aggregating zero-adv ratio.
+    window_size: 5
+
+    # Steps before the multiplier activates (early steps may have high zero-adv from format issues).
+    # 0 means auto (2 × window_size).
+    warm_up_steps: 0
+
+    # How to aggregate zero-adv ratio over the window: "mean", "median", or "min".
+    zero_adv_stats: median
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

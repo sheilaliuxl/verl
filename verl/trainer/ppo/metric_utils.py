@@ -15,7 +15,8 @@
 Metrics related to the PPO trainer.
 """
 
-from collections import defaultdict
+import math
+from collections import defaultdict, deque
 from functools import partial
 from typing import Any, Callable
 
@@ -34,6 +35,7 @@ KEY_NUM_TOKENS_CORRECTION_FACTOR = "batch_num_tokens_correction_factor"
 KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP = "original_batch_size_per_dp_group"
 KEY_RESPONSE_MASK = "response_mask"
 KEY_UID = "uid"
+METRIC_NAME_ZERO_ADV_RATIO = "critic/advantages/zero_adv_ratio"
 
 
 ZERO_ADV_EPS = 1e-8
@@ -42,6 +44,90 @@ ZERO_ADV_MAX_UNIQ_SCORES = 10
 
 def ceildiv(a: int, b: int) -> int:
     return -(-a // b)
+
+
+ZERO_ADV_STATS_VALUES = ("mean", "median", "min")
+
+
+def aggregate_zero_adv_window(zero_adv_window: deque[float], zero_adv_stats: str = "median") -> float:
+    """Aggregate the zero-adv ratio window into a single value.
+
+    Args:
+        zero_adv_window: Deque of recent per-step zero-adv ratios (0.0 to 1.0).
+        zero_adv_stats: Aggregation method: "mean", "median", or "min".
+
+    Returns:
+        Aggregated zero-adv ratio (0.0 if window is empty).
+    """
+    if zero_adv_stats not in ZERO_ADV_STATS_VALUES:
+        raise ValueError(f"zero_adv_stats must be one of {ZERO_ADV_STATS_VALUES}, got {zero_adv_stats!r}")
+    if not zero_adv_window:
+        return 0.0
+    if zero_adv_stats == "min":
+        return min(zero_adv_window)
+    if zero_adv_stats == "mean":
+        return float(np.mean(zero_adv_window))
+    # median
+    return float(np.median(zero_adv_window))
+
+
+def compute_gen_batch_multiplier(
+    zero_adv_window: deque[float], max_num_gen_batches: int, zero_adv_stats: str = "median"
+) -> int:
+    """Compute how many gen batches to pull based on recent zero-adv ratios.
+
+    Aggregates the window using ``zero_adv_stats`` (mean, median, or min),
+    then: multiplier = min(floor(1 / (1 - p)), max_num_gen_batches).
+
+    Args:
+        zero_adv_window: Deque of recent per-step zero-adv ratios (0.0 to 1.0).
+        max_num_gen_batches: Cap on the multiplier.
+        zero_adv_stats: Aggregation over the window: "mean", "median", or "min".
+
+    Returns:
+        Number of gen batches to use (1 = no extra batches).
+    """
+    p = aggregate_zero_adv_window(zero_adv_window, zero_adv_stats)
+
+    if p <= 0:
+        return 1
+    if p >= 1.0:
+        return max_num_gen_batches
+
+    return min(math.floor(1.0 / (1.0 - p)), max_num_gen_batches)
+
+
+def pull_and_merge_gen_batches(
+    first_batch: DataProto,
+    dl_iter,
+    num_extra_batches: int,
+) -> tuple[DataProto, int]:
+    """Pull extra batches from a dataloader iterator and merge with the first batch.
+
+    Respects epoch boundaries: stops pulling when the iterator is exhausted (StopIteration).
+    Each extra batch_dict is converted to DataProto via DataProto.from_single_dict before merging.
+
+    Args:
+        first_batch: The initial batch (already converted to DataProto).
+        dl_iter: The dataloader iterator to pull additional batch_dicts from.
+        num_extra_batches: Number of additional batches to pull (0 means no extra).
+
+    Returns:
+        (merged_batch, num_extra_pulled): The concatenated batch and how many extra were actually pulled.
+    """
+    if num_extra_batches <= 0:
+        return first_batch, 0
+
+    batches = [first_batch]
+    for _ in range(num_extra_batches):
+        try:
+            extra_dict = next(dl_iter)
+        except StopIteration:
+            break
+        batches.append(DataProto.from_single_dict(extra_dict))
+
+    num_pulled = len(batches) - 1
+    return (DataProto.concat(batches) if num_pulled > 0 else first_batch), num_pulled
 
 
 def maybe_add_corrected_mfu(metrics: dict, meta_info: dict) -> None:
@@ -329,7 +415,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
         "critic/advantages/zero_adv_count": num_zero_adv,
-        "critic/advantages/zero_adv_ratio": num_zero_adv / num_responses if num_responses > 0 else 0.0,
+        METRIC_NAME_ZERO_ADV_RATIO: num_zero_adv / num_responses if num_responses > 0 else 0.0,
         **zero_adv_metrics,
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),

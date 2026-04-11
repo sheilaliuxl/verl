@@ -187,6 +187,27 @@ def validate_config(
             " is computed on the filtered batch only, not the full batch."
         )
 
+    agb_config = config.algorithm.get("adaptive_gen_batch", None)
+    if agb_config is not None and agb_config.get("enable", False):
+        fza = config.algorithm.filter_zero_adv
+        if not fza.enable:
+            raise ValueError(
+                "algorithm.adaptive_gen_batch requires algorithm.filter_zero_adv.enable=True"
+                " — extra batches are only useful when zero-adv responses are filtered."
+            )
+        if fza.match_loss_curve:
+            raise ValueError(
+                "algorithm.adaptive_gen_batch requires algorithm.filter_zero_adv.match_loss_curve=False"
+                " (mlcF) — split-then-filter mode does not reduce actor compute."
+            )
+        from verl.trainer.ppo.metric_utils import ZERO_ADV_STATS_VALUES  # nested to avoid circular import
+
+        stats = agb_config.get("zero_adv_stats", "median")
+        if stats not in ZERO_ADV_STATS_VALUES:
+            raise ValueError(
+                f"algorithm.adaptive_gen_batch.zero_adv_stats must be one of {ZERO_ADV_STATS_VALUES}, got {stats!r}."
+            )
+
     # critic
     if use_critic:
         critic_config = omega_conf_to_dataclass(config.critic)

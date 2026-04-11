@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from collections import deque
 
 import torch
 from parameterized import parameterized
@@ -24,9 +25,12 @@ from verl.trainer.ppo.metric_utils import (
     KEY_NUM_TOKENS_CORRECTION_FACTOR,
     KEY_ORIGINAL_BATCH_SIZE_PER_DP_GROUP,
     ZERO_ADV_EPS,
+    aggregate_zero_adv_window,
     ceildiv,
+    compute_gen_batch_multiplier,
     filter_zero_adv_batch,
     maybe_add_corrected_mfu,
+    pull_and_merge_gen_batches,
 )
 
 EXPECTED_METRIC_KEYS = (
@@ -36,6 +40,33 @@ EXPECTED_METRIC_KEYS = (
     "actor/filter_zero_adv/num_padded",
     "actor/filter_zero_adv/num_total",
 )
+
+
+def _make_simple_batch(batch_size, seq_len=4, label=""):
+    """Helper to create a simple DataProto batch for pull_and_merge tests."""
+    td = TensorDict(
+        {
+            "input_ids": torch.arange(batch_size * seq_len).reshape(batch_size, seq_len).float(),
+            "attention_mask": torch.ones(batch_size, seq_len),
+        },
+        batch_size=(batch_size,),
+    )
+    return DataProto(batch=td)
+
+
+def _make_batch_dicts(num_batches, batch_size=4, seq_len=4):
+    """Create a list of batch_dicts (as a dataloader would yield)."""
+    dicts = []
+    for i in range(num_batches):
+        td = TensorDict(
+            {
+                "input_ids": torch.full((batch_size, seq_len), float(i + 1)),
+                "attention_mask": torch.ones(batch_size, seq_len),
+            },
+            batch_size=(batch_size,),
+        )
+        dicts.append(td)
+    return dicts
 
 
 def _make_batch(num_nonzero, num_zero, seq_len, attention_lengths=None):
@@ -138,6 +169,173 @@ class TestMaybeAddCorrectedMfu(unittest.TestCase):
         self.assertEqual(sorted(metrics.keys()), ["perf/mfu/actor", "perf/mfu/actor_corrected"])
         self.assertAlmostEqual(metrics["perf/mfu/actor_corrected"], 0.15, places=6)
         self.assertAlmostEqual(metrics["perf/mfu/actor"], 0.30)
+
+
+class TestComputeGenBatchMultiplier(unittest.TestCase):
+    """Tests for aggregate_zero_adv_window and compute_gen_batch_multiplier."""
+
+    @parameterized.expand(
+        (
+            ("empty", [], "median", 0.0),
+            ("min_basic", [0.3, 0.5, 0.7], "min", 0.3),
+            ("mean_basic", [0.2, 0.4, 0.6], "mean", 0.4),
+            ("median_odd", [0.3, 0.9, 0.5], "median", 0.5),
+            ("median_even", [0.3, 0.5, 0.7, 0.9], "median", 0.6),
+        )
+    )
+    def test_aggregate_zero_adv_window(self, _name, window_values, stats, expected):
+        self.assertAlmostEqual(aggregate_zero_adv_window(deque(window_values), stats), expected)
+
+    @parameterized.expand(("max", "invalid", "sum"))
+    def test_invalid_stats_raises(self, stats):
+        with self.assertRaises(ValueError):
+            aggregate_zero_adv_window(deque([0.5]), stats)
+
+    @parameterized.expand(
+        (
+            # (name, window_values, max_num_gen_batches, stats, expected_multiplier)
+            ("empty_window", [], 3, "min", 1),
+            ("all_zeros", [0.0, 0.0, 0.0, 0.0, 0.0], 3, "min", 1),
+            ("min_p_0.3_cap3", [0.5, 0.4, 0.3, 0.6, 0.7], 3, "min", 1),
+            ("min_p_0.5_cap3", [0.6, 0.5, 0.7, 0.6, 0.55], 3, "min", 2),
+            ("min_p_0.6_cap3", [0.7, 0.8, 0.6, 0.65, 0.75], 3, "min", 2),
+            ("min_p_0.7_cap3", [0.8, 0.75, 0.85, 0.7, 0.9], 3, "min", 3),
+            ("min_p_0.7_cap5", [0.8, 0.75, 0.85, 0.7, 0.9], 5, "min", 3),
+            ("min_p_0.8_cap3", [0.85, 0.9, 0.8, 0.82, 0.88], 3, "min", 3),
+            ("min_p_0.8_cap5", [0.85, 0.9, 0.82, 0.8, 0.88], 5, "min", 5),
+            ("min_p_0.9_cap5", [0.92, 0.95, 0.9, 0.91, 0.93], 5, "min", 5),
+            ("min_p_1.0_cap3", [1.0, 1.0, 1.0], 3, "min", 3),
+            ("min_single_value", [0.6], 4, "min", 2),
+            ("min_mixed_with_zero", [0.5, 0.0, 0.6], 3, "min", 1),
+            ("min_warmup_zeros_then_real", [0.0, 0.0, 0.0, 0.6, 0.7], 3, "min", 1),
+            ("median_p_0.7_cap3", [0.7, 0.8, 0.6, 0.65, 0.75], 3, "median", 3),
+            ("median_p_0.8_cap5", [0.85, 0.9, 0.82, 0.8, 0.88], 5, "median", 5),
+            ("median_mixed_with_zero", [0.5, 0.0, 0.6], 3, "median", 2),
+            ("median_warmup_zeros_then_real", [0.0, 0.0, 0.0, 0.6, 0.7], 3, "median", 1),
+            ("median_single", [0.8], 5, "median", 5),
+            ("mean_p_0.8_cap5", [0.85, 0.9, 0.82, 0.8, 0.88], 5, "mean", 5),
+            ("mean_mixed_with_zero", [0.5, 0.0, 0.6], 3, "mean", 1),
+            ("mean_warmup_zeros_then_real", [0.0, 0.0, 0.0, 0.6, 0.7], 3, "mean", 1),
+        )
+    )
+    def test_compute_gen_batch_multiplier(self, _name, window_values, max_cap, stats, expected):
+        self.assertEqual(compute_gen_batch_multiplier(deque(window_values), max_cap, stats), expected)
+
+
+class TestPullAndMergeGenBatches(unittest.TestCase):
+    """Tests for pull_and_merge_gen_batches in metric_utils.py."""
+
+    # ------------------------------------------------------------------ #
+    #  No-op cases: original batch returned as-is
+    # ------------------------------------------------------------------ #
+
+    @parameterized.expand(
+        (
+            ("num_extra_zero", 4, 0),
+            ("num_extra_negative", 4, -1),
+            ("epoch_boundary_empty", 4, 2),
+        )
+    )
+    def test_no_op(self, _name, first_bs, num_extra):
+        """Original batch returned unchanged when no extra batches pulled."""
+        first = _make_simple_batch(first_bs)
+        result, num_pulled = pull_and_merge_gen_batches(first, iter([]), num_extra)
+        self.assertIs(result, first)
+        self.assertEqual(num_pulled, 0)
+
+    # ------------------------------------------------------------------ #
+    #  Pull cases: extra batches merged
+    # ------------------------------------------------------------------ #
+
+    @parameterized.expand(
+        (
+            # (name, first_bs, extra_bs, num_avail, num_extra, expected_pulled, remaining, expected_ids)
+            (
+                "pull_one",
+                4,
+                4,
+                1,
+                1,
+                1,
+                0,
+                torch.cat(
+                    [
+                        torch.arange(16).reshape(4, 4).float(),
+                        torch.full((4, 4), 1.0),
+                    ]
+                ),
+            ),
+            (
+                "pull_two",
+                4,
+                4,
+                3,
+                2,
+                2,
+                1,
+                torch.cat(
+                    [
+                        torch.arange(16).reshape(4, 4).float(),
+                        torch.full((4, 4), 1.0),
+                        torch.full((4, 4), 2.0),
+                    ]
+                ),
+            ),
+            (
+                "epoch_boundary_partial",
+                4,
+                4,
+                1,
+                3,
+                1,
+                0,
+                torch.cat(
+                    [
+                        torch.arange(16).reshape(4, 4).float(),
+                        torch.full((4, 4), 1.0),
+                    ]
+                ),
+            ),
+            (
+                "different_batch_sizes",
+                3,
+                5,
+                1,
+                1,
+                1,
+                0,
+                torch.cat(
+                    [
+                        torch.arange(12).reshape(3, 4).float(),
+                        torch.full((5, 4), 1.0),
+                    ]
+                ),
+            ),
+        )
+    )
+    def test_pull(self, _name, first_bs, extra_bs, num_avail, num_extra, expected_pulled, remaining, expected_ids):
+        seq_len = 4
+        first = _make_simple_batch(first_bs, seq_len=seq_len)
+        extra_dicts = _make_batch_dicts(num_avail, batch_size=extra_bs, seq_len=seq_len)
+        dl_iter = iter(extra_dicts)
+        result, num_pulled = pull_and_merge_gen_batches(first, dl_iter, num_extra)
+        self.assertEqual(num_pulled, expected_pulled)
+        self.assertEqual(len(list(dl_iter)), remaining)
+        torch.testing.assert_close(result.batch["input_ids"], expected_ids)
+
+    def test_values_preserved(self):
+        """Verify tensor values are preserved after merge with explicit values."""
+        first = _make_simple_batch(2, seq_len=3)
+        first.batch["input_ids"] = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        extra_dicts = _make_batch_dicts(1, batch_size=2, seq_len=3)
+        extra_dicts[0]["input_ids"] = torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]])
+        result, num_pulled = pull_and_merge_gen_batches(first, iter(extra_dicts), 1)
+        self.assertEqual(num_pulled, 1)
+        self.assertEqual(result.batch.batch_size[0], 4)
+        torch.testing.assert_close(
+            result.batch["input_ids"],
+            torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]),
+        )
 
 
 class TestFilterZeroAdvBatch(unittest.TestCase):
